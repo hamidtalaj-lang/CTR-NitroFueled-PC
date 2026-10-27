@@ -91,12 +91,6 @@ jobs:
             New-Item -ItemType Directory -Force -Path (Split-Path $dest) | Out-Null
             git -c core.longpaths=true clone --depth 1 $module.Url $dest
             if ($LASTEXITCODE -ne 0) { throw "Failed to clone $($module.Path)" }
-            if ($module.Path -eq "gpu/third_party/fsr-vulkan") {
-              git -C $dest fetch --depth 1 origin c64f093
-              if ($LASTEXITCODE -ne 0) { throw "Failed to fetch FSR base c64f093" }
-              git -C $dest checkout --detach FETCH_HEAD
-              if ($LASTEXITCODE -ne 0) { throw "Failed to checkout FSR base c64f093" }
-            }
           }
 
       - name: Disable local FSR patch application (leave FSR code in build)
