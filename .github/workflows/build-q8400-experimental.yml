@@ -93,6 +93,21 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw "Failed to clone $($module.Path)" }
           }
 
+      - name: Fix missing standard mutex include in FSR Vulkan backend
+        shell: pwsh
+        run: |
+          $root = Get-ChildItem source-unpacked -Directory | Select-Object -First 1
+          $file = Join-Path $root.FullName "gpu/third_party/fsr-vulkan/upstream/ffx-1.1.4/sdk/src/backends/vk/ffx_vk.cpp"
+          if (!(Test-Path -LiteralPath $file)) { throw "FSR backend source not found: $file" }
+          $content = Get-Content -LiteralPath $file -Raw
+          if ($content -notmatch '(?m)^\s*#\s*include\s*[<"]mutex[>"]') {
+            Set-Content -LiteralPath $file -Value ("#include <mutex>`r`n" + $content) -NoNewline
+            Write-Host "Added missing #include <mutex> to ffx_vk.cpp"
+          } else {
+            Write-Host "ffx_vk.cpp already includes mutex; no edit needed"
+          }
+          Select-String -LiteralPath $file -Pattern '^\s*#\s*include\s*[<"]mutex[>"]' | Select-Object -First 1
+
       - name: Disable local FSR patch application (leave FSR code in build)
         shell: pwsh
         run: |
