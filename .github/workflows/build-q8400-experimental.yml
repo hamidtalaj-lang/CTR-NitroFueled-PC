@@ -1,4 +1,4 @@
-name: Build CTR Q8400 experimental (Windows, individually tested FSR patches)
+name: Build CTR Q8400 experimental (Windows, clean FSR checkout)
 
 on:
   workflow_dispatch:
@@ -124,39 +124,20 @@ jobs:
             }
           }
 
-      - name: Test and apply FSR patches one by one
+      - name: Reset FSR-Vulkan to clean pinned source before build
         shell: pwsh
         run: |
           $root = Get-ChildItem source-unpacked -Directory | Select-Object -First 1
           $fsr = Join-Path $root.FullName "gpu/third_party/fsr-vulkan"
-          $patchDir = Join-Path $root.FullName "gpu/patches/fsr-vulkan"
-          if (!(Test-Path $fsr)) { throw "FSR-Vulkan checkout is missing." }
-          if (!(Test-Path $patchDir)) { throw "FSR patch directory is missing." }
-
-          # Apply patches sequentially against the exact pinned checkout. If a patch
-          # does not apply, remove that patch so build.sh cannot fail on it later.
-          Get-ChildItem -LiteralPath $patchDir -Filter "*.patch" | Sort-Object Name | ForEach-Object {
-            $patch = $_.FullName
-            Write-Host "===== Testing $($_.Name) ====="
-            git -C $fsr apply --check $patch 2>&1
-            if ($LASTEXITCODE -eq 0) {
-              git -C $fsr apply $patch
-              if ($LASTEXITCODE -ne 0) { throw "Patch passed check but failed to apply: $($_.Name)" }
-              Write-Host "APPLIED: $($_.Name)"
-            } else {
-              Write-Warning "SKIPPED incompatible patch: $($_.Name)"
-              Remove-Item -LiteralPath $patch -Force
-            }
-          }
-          # The test above applies compatible patches to validate them. Undo those
-          # temporary changes before build.sh runs, because build.sh owns the real
-          # patch-application step and must apply each patch exactly once.
+          if (!(Test-Path (Join-Path $fsr ".git"))) { throw "FSR-Vulkan git checkout is missing." }
+          # Ensure build.sh starts from a clean upstream checkout. Do not pre-apply
+          # patches here; build.sh is responsible for applying the project's patches.
           git -C $fsr reset --hard c64f093
-          if ($LASTEXITCODE -ne 0) { throw "Could not reset FSR-Vulkan after patch validation." }
+          if ($LASTEXITCODE -ne 0) { throw "Could not reset FSR-Vulkan to c64f093." }
           git -C $fsr clean -fd
-          if ($LASTEXITCODE -ne 0) { throw "Could not clean FSR-Vulkan after patch validation." }
-          Write-Host "===== Compatible patch files retained for build.sh ====="
-          Get-ChildItem -LiteralPath $patchDir -Filter "*.patch" | Select-Object -ExpandProperty Name
+          if ($LASTEXITCODE -ne 0) { throw "Could not clean FSR-Vulkan checkout." }
+          git -C $fsr status --short
+          git -C $fsr rev-parse --short HEAD
 
       - name: Build Windows binaries
         shell: msys2 {0}
@@ -181,7 +162,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: CTR-Q8400-experimental-individually-tested-fsr-patches
+          name: CTR-Q8400-experimental-clean-fsr-checkout
           path: |
             source-unpacked/**/out/*.exe
             source-unpacked/**/out/VERSION
