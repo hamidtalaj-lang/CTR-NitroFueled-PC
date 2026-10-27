@@ -1,0 +1,1074 @@
+diff --git a/build.sh b/build.sh
+index 7fdc4fa..ee045fa 100644
+--- a/build.sh
++++ b/build.sh
+@@ -96,8 +96,9 @@ fi
+ # $ORIGIN/gpu: packaged copies keep the library next to the binary without patching it.
+ gpu=(-Lout/gpu -lbbgpu -Wl,-rpath,'$ORIGIN/gpu' -Wl,-rpath,"$PWD/out/gpu" -rdynamic)
+ runtime=(src/runtime*.c)
+-# isa_emulate runs inside guest code: no XMM/YMM.
+-"$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -mgeneral-regs-only -c src/isa_emulate.c -o out/isa_emulate.o
++# The rewrite stub saves/restores all guest XMM low halves. The emulator may therefore use
++# baseline SSE2 for scalar FP arithmetic; AVX itself is implemented with software shadow state.
++"$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -mno-avx -mno-avx2 -mno-sse4.2 -mno-popcnt -mno-bmi -mno-lzcnt -mno-movbe -mno-f16c -c src/isa_emulate.c -o out/isa_emulate.o
+ # Third-party decoders: compiled once, without this project's -Werror policy.
+ atrac9=(third_party/LibAtrac9/C/src/*.c)
+ if [[ ! -f out/libatrac9.a || -n $(find third_party/LibAtrac9/C/src -newer out/libatrac9.a -name '*.c') ]]; then
+@@ -119,6 +120,10 @@ echo "Version: $version (out/VERSION)"
+ # GPU check for run.sh (live_resolution=auto) and the launcher's gamepad list (--gamepads).
+ "$CC" -std=c11 -O2 -Wall -Wextra -Werror "${includes[@]}" tools/gpu_capabilities.c "${libraries[@]}" -o out/bb-gpu-capabilities
+ if [[ ${1:-} == --test ]]; then
++    "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -mno-avx -mno-avx2 -mno-sse4.2 -mno-popcnt -mno-bmi -mno-lzcnt -mno-movbe -mno-f16c -Isrc src/isa_emulate.c tests/test_isa_emulate.c -o out/isa-emulate-test
++    out/isa-emulate-test
++    "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -mno-avx -mno-avx2 -mno-sse4.2 -mno-popcnt -mno-bmi -mno-lzcnt -mno-movbe -mno-f16c -Isrc src/isa_emulate.c src/isa_rewrite.c tests/test_isa_rewrite_stub.c -o out/isa-rewrite-stub-test
++    out/isa-rewrite-stub-test
+     "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread "${includes[@]}" -I. -Isrc tests/test_pad.c "${libraries[@]}" -o out/pad-test
+     out/pad-test
+     "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -I. -Isrc tests/test_runtime.c "${runtime[@]}" out/libatrac9.a -lm "${gpu[@]}" "${libraries[@]}" -o out/runtime-test
+diff --git a/docs/sacredfire/18-q8400-isa-emulation-experimental.md b/docs/sacredfire/18-q8400-isa-emulation-experimental.md
+new file mode 100644
+index 0000000..f9852d7
+--- /dev/null
++++ b/docs/sacredfire/18-q8400-isa-emulation-experimental.md
+@@ -0,0 +1,28 @@
++# Experimental older-CPU ISA emulation (Q8400 research)
++
++This is an experimental, fail-closed extension of the v0.4 ISA rewrite. It is **not a complete AVX emulator** and does not claim that CTR Nitro-Fueled will run on a Core 2 Quad Q8400.
++
++## What it adds
++
++- `POPCNT` software emulation, including the architecturally defined flags.
++- `CRC32` (SSE4.2 CRC32C) and `PCMPGTQ` emulation.
++- A software shadow for the upper 128 bits of each YMM register, per thread. Low XMM halves are saved/restored by rewrite stubs and copied through the OS trap context for INT3 sites. MXCSR is propagated through the trap context.
++- AVX emulation for `VZEROUPPER`, `VZEROALL`, unaligned `VMOVUPS`, `VMOVUPD`, `VMOVDQU`, `VMOVMSKPS/PD`, `VPMOVMSKB`, packed bitwise operations (`VAND*`, `VANDN*`, `VOR*`, `VXOR*`), packed/scalar add/subtract/multiply/divide, `VSHUFPS/PD`, `VPSHUFD`, `VPERM2F128/I128`, `VINSERTF128`, `VEXTRACTF128` and immediate blend operations in the scanner allowlist.
++- The scanner now records other VEX instructions as unsupported and prints their mnemonic counts. The loader refuses to rewrite/run when the current CPU is missing AVX/SSE4.2 and any required site is unsupported. This is deliberate; it avoids an illegal instruction crash after a partial rewrite.
++
++## Not yet implemented
++
++Many AVX/AVX2 instructions are not emulated: other shuffle/permutation/blend forms, compares, conversions, gathers, most integer AVX2 operations and several other families. Aligned vector moves are also intentionally excluded because they must reproduce alignment-fault behavior. SSE4.2 string-comparison instructions (`PCMPESTRI/M`, `PCMPISTRI/M`) are reported unsupported. F16C remains unsupported. If any of these instructions occur in the prepared executable, the runtime will stop and list the count rather than pretending compatibility.
++
++## Tests
++
++The standalone C tests exercise the emulated vector operations, YMM upper-half shadow, CRC32C, POPCNT and rewrite-stub size. Build them on an x86-64 GCC/Clang host with:
++
++```sh
++cc -std=c11 -O2 -Wall -Wextra -Werror -mno-avx -mno-avx2 -mno-sse4.2 -mno-popcnt -mno-bmi -mno-lzcnt -mno-movbe -mno-f16c -Isrc src/isa_emulate.c tests/test_isa_emulate.c -o /tmp/isa-emulate-test
++/tmp/isa-emulate-test
++cc -std=c11 -O2 -Wall -Wextra -Werror -mno-avx -mno-avx2 -mno-sse4.2 -mno-popcnt -mno-bmi -mno-lzcnt -mno-movbe -mno-f16c -Isrc src/isa_emulate.c src/isa_rewrite.c tests/test_isa_rewrite_stub.c -o /tmp/isa-rewrite-test
++/tmp/isa-rewrite-test
++```
++
++The C smoke tests passed in the development environment. The full Windows build and scanner against the user's prepared `boot-linked.bin` have not been run here; the Linux environment does not have the `iced_x86` native decoder installed. Do not use `BB_SKIP_CPU_CHECK=1` as a substitute for instruction emulation.
+diff --git a/scripts/isa_rewrite.py b/scripts/isa_rewrite.py
+index 32671a0..a0f20a7 100644
+--- a/scripts/isa_rewrite.py
++++ b/scripts/isa_rewrite.py
+@@ -1,10 +1,8 @@
+-"""Find the Haswell-only instructions (MOVBE, LZCNT, BMI1, F16C) in the linked image.
++"""Find older-host ISA sites (MOVBE, LZCNT, BMI1, POPCNT, SSE4.2 and AVX) in the linked image.
+ 
+-scan_segment decodes one executable segment with iced-x86 and classifies each
+-site: JMP (5+ bytes, patched with a jump to a stub), JMP_RELOCATE (4 bytes,
+-the jump also covers the plain next instruction, copied into the stub), INT3
+-(4 bytes, trapped at run time) or UNSUPPORTED (an encoding the stubs do not
+-emulate: segment override, LOCK, 32-bit addressing or F16C).
++scan_segment decodes executable segments with iced-x86 and classifies each
++site: JMP (5+ bytes), JMP_RELOCATE (4 bytes plus a safe following instruction),
++INT3 (1-4 bytes) or UNSUPPORTED (an encoding the emulator does not implement).
+ 
+ Usage: isa_rewrite.py out/boot-linked.bin --out out
+ Reads the BBPROBE5 image, scans its executable segments and writes
+@@ -22,19 +20,39 @@ from prepare import span, unpack
+ 
+ try:
+     import iced_x86
+-    from iced_x86 import Code, Decoder, FlowControl, Mnemonic, OpKind, Register, RegisterExt
++    from iced_x86 import Code, Decoder, EncodingKind, FlowControl, Mnemonic, OpKind, Register, RegisterExt
+ except ImportError:
+     iced_x86 = None
+ 
+ (KIND_MOVBE_LOAD, KIND_MOVBE_STORE, KIND_LZCNT, KIND_TZCNT, KIND_ANDN, KIND_BEXTR,
+- KIND_BLSI, KIND_BLSMSK, KIND_BLSR, KIND_VCVTPH2PS, KIND_VCVTPS2PH) = range(1, 12)
++ KIND_BLSI, KIND_BLSMSK, KIND_BLSR, KIND_VCVTPH2PS, KIND_VCVTPS2PH, KIND_POPCNT,
++ KIND_AVX, KIND_CRC32, KIND_SSE42_UNSUPPORTED, KIND_PCMPGTQ) = range(1, 17)
+ MODE_JMP, MODE_JMP_RELOCATE, MODE_INT3, MODE_UNSUPPORTED = range(4)
+ NO_REG = 0xFF
+ HEADER = struct.Struct('<8sQ32sII8x')                # magic, image size, sha256, sites, unsupported
+ RECORD = struct.Struct('<QBBBBBBBBBBBB4xq15sB15sx')  # mirrors IsaSite in the C loader
+ SET_OF_KIND = {KIND_MOVBE_LOAD: 'MOVBE', KIND_MOVBE_STORE: 'MOVBE', KIND_LZCNT: 'LZCNT',
+                KIND_TZCNT: 'BMI1', KIND_ANDN: 'BMI1', KIND_BEXTR: 'BMI1', KIND_BLSI: 'BMI1',
+-               KIND_BLSMSK: 'BMI1', KIND_BLSR: 'BMI1', KIND_VCVTPH2PS: 'F16C', KIND_VCVTPS2PH: 'F16C'}
++               KIND_BLSMSK: 'BMI1', KIND_BLSR: 'BMI1', KIND_VCVTPH2PS: 'F16C', KIND_VCVTPS2PH: 'F16C',
++               KIND_POPCNT: 'POPCNT', KIND_AVX: 'AVX', KIND_CRC32: 'SSE4.2', KIND_SSE42_UNSUPPORTED: 'SSE4.2', KIND_PCMPGTQ: 'SSE4.2'}
++
++# These are deliberately conservative. Any other VEX instruction is recorded as UNSUPPORTED,
++# so the loader stops instead of silently executing an AVX opcode on a non-AVX CPU.
++MNEMONIC_NAMES = ({value: name for name, value in vars(Mnemonic).items() if name.isupper() and isinstance(value, int)}
++                   if iced_x86 is not None else {})
++
++def mnemonic_name(ins):
++    return MNEMONIC_NAMES.get(ins.mnemonic, str(ins.mnemonic))
++
++
++AVX_SUPPORTED = {
++    'VZEROUPPER', 'VZEROALL', 'VMOVUPS', 'VMOVUPD', 'VMOVDQU', 'VMOVMSKPS', 'VMOVMSKPD', 'VPMOVMSKB',
++    'VXORPS', 'VXORPD', 'VANDPS', 'VANDPD', 'VORPS', 'VORPD', 'VANDNPS', 'VANDNPD',
++    'VADDPS', 'VSUBPS', 'VMULPS', 'VDIVPS', 'VADDPD', 'VSUBPD', 'VMULPD', 'VDIVPD',
++    'VADDSS', 'VSUBSS', 'VMULSS', 'VDIVSS', 'VADDSD', 'VSUBSD', 'VMULSD', 'VDIVSD',
++    'VSHUFPS', 'VSHUFPD', 'VPSHUFD', 'VPERM2F128', 'VPERM2I128', 'VINSERTF128', 'VEXTRACTF128',
++    'VBLENDPS', 'VBLENDPD', 'VPBLENDD',
++}
+ 
+ 
+ @dataclass
+@@ -55,16 +73,29 @@ class Site:
+     disp: int
+     original: bytes
+     relocated: bytes
++    mnemonic: str = ''  # diagnostic only; not serialized into BBISA1
+ 
+ 
+ def kind_of(ins):
+     m = ins.mnemonic
+     if m == Mnemonic.MOVBE:
+         return KIND_MOVBE_LOAD if ins.op0_kind == OpKind.REGISTER else KIND_MOVBE_STORE
+-    return {Mnemonic.LZCNT: KIND_LZCNT, Mnemonic.TZCNT: KIND_TZCNT, Mnemonic.ANDN: KIND_ANDN,
+-            Mnemonic.BEXTR: KIND_BEXTR, Mnemonic.BLSI: KIND_BLSI, Mnemonic.BLSMSK: KIND_BLSMSK,
+-            Mnemonic.BLSR: KIND_BLSR, Mnemonic.VCVTPH2PS: KIND_VCVTPH2PS,
+-            Mnemonic.VCVTPS2PH: KIND_VCVTPS2PH}.get(m)
++    if m == Mnemonic.CRC32:
++        return KIND_CRC32
++    sse42_names = {'PCMPESTRI', 'PCMPESTRM', 'PCMPISTRI', 'PCMPISTRM', 'PCMPGTQ'}
++    if MNEMONIC_NAMES.get(m, str(m)) == 'PCMPGTQ':
++        return KIND_PCMPGTQ
++    if MNEMONIC_NAMES.get(m, str(m)) in sse42_names:
++        return KIND_SSE42_UNSUPPORTED
++    legacy = {Mnemonic.LZCNT: KIND_LZCNT, Mnemonic.TZCNT: KIND_TZCNT, Mnemonic.ANDN: KIND_ANDN,
++              Mnemonic.BEXTR: KIND_BEXTR, Mnemonic.BLSI: KIND_BLSI, Mnemonic.BLSMSK: KIND_BLSMSK,
++              Mnemonic.BLSR: KIND_BLSR, Mnemonic.VCVTPH2PS: KIND_VCVTPH2PS,
++              Mnemonic.VCVTPS2PH: KIND_VCVTPS2PH, Mnemonic.POPCNT: KIND_POPCNT}.get(m)
++    if legacy is not None:
++        return legacy
++    if getattr(ins, 'encoding', None) == EncodingKind.VEX:
++        return KIND_AVX
++    return None
+ 
+ 
+ def register_number(reg):
+@@ -74,17 +105,36 @@ def register_number(reg):
+ def site_of(ins, kind, original):
+     """Operands in order fill dst, src1, src2; the memory operand leaves its slot NO_REG."""
+     regs, mem_slot, width = [NO_REG] * 3, 0, 0
++    extra_register_operand = False
+     for i in range(ins.op_count):
+         if ins.op_kind(i) == OpKind.REGISTER:
+-            regs[i] = register_number(ins.op_register(i))
++            if i < 3:
++                regs[i] = register_number(ins.op_register(i))
++            else:
++                extra_register_operand = True
+             width = width or RegisterExt.size(ins.op_register(i)) * 8
+         elif ins.op_kind(i) == OpKind.MEMORY:
+             mem_slot = 1 if i == 0 else 2
+     if SET_OF_KIND[kind] == 'F16C':
+         width = 0
++    if kind == KIND_AVX:
++        # For instructions such as VMOVMSKPS, operand 0 is a GPR; use the widest vector operand.
++        vector_bytes = max((RegisterExt.size(ins.op_register(i)) for i in range(ins.op_count)
++                            if ins.op_kind(i) == OpKind.REGISTER and RegisterExt.size(ins.op_register(i)) in (16, 32)),
++                           default=0)
++        width = vector_bytes * 8
++        # IsaSite.width is one byte; 255 is the internal marker for 256-bit YMM operands.
++        if width == 256:
++            width = 255
+     base = index = NO_REG
+     scale = mem_flags = disp = 0
+-    unsupported = SET_OF_KIND[kind] == 'F16C' or ins.segment_prefix != Register.NONE or ins.has_lock_prefix
++    unsupported = (SET_OF_KIND[kind] == 'F16C' or ins.segment_prefix != Register.NONE or ins.has_lock_prefix
++                   or extra_register_operand
++                   or (kind == KIND_AVX and mnemonic_name(ins) not in AVX_SUPPORTED)
++                   or kind == KIND_SSE42_UNSUPPORTED)
++    if kind == KIND_CRC32 and ins.op_count > 1 and ins.op_kind(1) == OpKind.REGISTER:
++        # AH/BH/CH/DH need a high-byte extraction not represented by IsaSite's GPR index.
++        unsupported |= ins.op_register(1) in (Register.AH, Register.BH, Register.CH, Register.DH)
+     if mem_slot:
+         unsupported |= any(r != Register.NONE and RegisterExt.size(r) != 8 for r in (ins.memory_base, ins.memory_index))
+         scale = ins.memory_index_scale
+@@ -95,7 +145,7 @@ def site_of(ins, kind, original):
+             disp = ins.memory_displacement  # iced reports it as u64; the table stores int64
+             disp -= (1 << 64) if disp >= 1 << 63 else 0
+     mode = MODE_UNSUPPORTED if unsupported else MODE_JMP if ins.len >= 5 else MODE_INT3
+-    return Site(ins.ip, ins.len, kind, width, mode, *regs, mem_slot, base, index, scale, mem_flags, disp, original, b'')
++    return Site(ins.ip, ins.len, kind, width, mode, *regs, mem_slot, base, index, scale, mem_flags, disp, original, b'', mnemonic_name(ins))
+ 
+ 
+ def is_plain(ins, end):
+@@ -157,11 +207,18 @@ def encode_table(image, sites):
+ 
+ 
+ def summary(sites):
+-    sets = [SET_OF_KIND[s.kind] for s in sites]
+     modes = [s.mode for s in sites]
+-    per_set = ', '.join(f'{name} {sets.count(name)}' for name in ('MOVBE', 'BMI1', 'LZCNT', 'F16C'))
+-    return (f'ISA: {len(sites)} sites ({per_set}); {modes.count(MODE_JMP_RELOCATE)} relocated, '
+-            f'{modes.count(MODE_INT3)} int3, {modes.count(MODE_UNSUPPORTED)} unsupported')
++    per_set = ', '.join(f'{name} {sum(1 for s in sites if SET_OF_KIND[s.kind] == name)}' for name in ('MOVBE', 'BMI1', 'LZCNT', 'F16C', 'POPCNT', 'AVX', 'SSE4.2'))
++    result = (f'ISA: {len(sites)} sites ({per_set}); {modes.count(MODE_JMP_RELOCATE)} relocated, '
++              f'{modes.count(MODE_INT3)} int3, {modes.count(MODE_UNSUPPORTED)} unsupported')
++    unsupported = {}
++    for site in sites:
++        if site.mode == MODE_UNSUPPORTED:
++            unsupported[site.mnemonic] = unsupported.get(site.mnemonic, 0) + 1
++    if unsupported:
++        details = ', '.join(f'{name} {count}' for name, count in sorted(unsupported.items(), key=lambda kv: (-kv[1], kv[0])))
++        result += f'; unsupported mnemonics: {details}'
++    return result
+ 
+ 
+ def fixture_code():
+diff --git a/src/cpu_check.c b/src/cpu_check.c
+index a92c971..a9ddaa8 100644
+--- a/src/cpu_check.c
++++ b/src/cpu_check.c
+@@ -14,17 +14,15 @@ CpuFeatureWords cpu_feature_words(void) {
+     return words;
+ }
+ 
+-/* Jaguar's sets beyond the x86-64 baseline that Intel CPUs also have (SSE4A is left out: the
+- * game runs on Intel). Each one arrived on Intel with Haswell at the latest. A missing fatal set
+- * stops the game; the rewritable ones, which Sandy Bridge and Ivy Bridge lack, can be emulated. */
++/* CPU features missing on an older Intel host. SSE4.2 and AVX are only admitted when the
++ * rewrite table contains supported sites; any unsupported instruction site stops startup. */
+ enum { LEAF1, LEAF7, EXT1 };
+ typedef struct { const char *name; int word; uint32_t bit; unsigned set; } CpuSet;
+-static const CpuSet fatal_sets[] = {
+-    {"SSE4.2", LEAF1, 1u << 20, 0}, {"POPCNT", LEAF1, 1u << 23, 0}, {"AVX", LEAF1, 1u << 28, 0},
+-};
+ static const CpuSet rewritable_sets[] = {
+     {"MOVBE", LEAF1, 1u << 22, CPU_SET_MOVBE}, {"F16C", LEAF1, 1u << 29, CPU_SET_F16C},
++    {"POPCNT", LEAF1, 1u << 23, CPU_SET_POPCNT},
+     {"BMI1", LEAF7, 1u << 3, CPU_SET_BMI1},    {"LZCNT", EXT1, 1u << 5, CPU_SET_LZCNT},
++    {"AVX", LEAF1, 1u << 28, CPU_SET_AVX}, {"SSE4.2", LEAF1, 1u << 20, CPU_SET_SSE42},
+ };
+ 
+ /* Names the missing sets, comma separated in out; returns how many, and their CPU_SET_* bits in *mask. */
+@@ -49,8 +47,9 @@ static int missing_sets(CpuFeatureWords words, const CpuSet *sets, size_t count,
+ }
+ 
+ int cpu_missing_fatal(CpuFeatureWords words, char *out, size_t size) {
+-    unsigned mask;
+-    return missing_sets(words, fatal_sets, sizeof fatal_sets / sizeof *fatal_sets, out, size, &mask);
++    (void)words;
++    if (size) out[0] = 0;
++    return 0;
+ }
+ 
+ unsigned cpu_missing_rewritable(CpuFeatureWords words, char *out, size_t size) {
+diff --git a/src/cpu_check.h b/src/cpu_check.h
+index f31e791..2e66ee0 100644
+--- a/src/cpu_check.h
++++ b/src/cpu_check.h
+@@ -10,10 +10,12 @@
+ typedef struct { uint32_t leaf1_ecx, leaf7_ebx, ext1_ecx; } CpuFeatureWords;
+ 
+ CpuFeatureWords cpu_feature_words(void);
+-enum { CPU_SET_MOVBE = 1u << 0, CPU_SET_BMI1 = 1u << 1, CPU_SET_LZCNT = 1u << 2, CPU_SET_F16C = 1u << 3 };
+-/* Fatal sets the host lacks (SSE4.2, POPCNT, AVX), comma separated in out; returns how many. */
++enum { CPU_SET_MOVBE = 1u << 0, CPU_SET_BMI1 = 1u << 1, CPU_SET_LZCNT = 1u << 2,
++       CPU_SET_F16C = 1u << 3, CPU_SET_POPCNT = 1u << 4, CPU_SET_AVX = 1u << 5,
++       CPU_SET_SSE42 = 1u << 6 };
++/* Fatal sets currently reserved for non-rewritable CPU requirements. */
+ int cpu_missing_fatal(CpuFeatureWords words, char *out, size_t size);
+-/* Rewritable sets the host lacks (MOVBE, F16C, BMI1, LZCNT): CPU_SET_* mask; names in out. */
++/* Rewritable sets the host lacks: CPU_SET_* mask; names in out. Unsupported sites fail closed. */
+ unsigned cpu_missing_rewritable(CpuFeatureWords words, char *out, size_t size);
+ 
+ #endif
+diff --git a/src/isa_emulate.c b/src/isa_emulate.c
+index a170e77..6d4cc3a 100644
+--- a/src/isa_emulate.c
++++ b/src/isa_emulate.c
+@@ -1,8 +1,13 @@
+-/* One call per stub: executes the guest's MOVBE/BMI1/LZCNT instruction on a host that lacks it
+- * (isa_emulate.h), from gow3_pc's isa_emulate.c (FelipePrado0/gow3_pc, GPL-2.0-or-later). */
++/* Runtime emulation for older hosts: MOVBE/BMI1/LZCNT/POPCNT/CRC32 and a conservative AVX
++ * subset. The AVX scanner fails closed on any instruction not implemented below. The original
++ * MOVBE/BMI1/LZCNT code is from gow3_pc (FelipePrado0/gow3_pc, GPL-2.0-or-later). */
+ #include "isa_emulate.h"
++#include <string.h>
+ 
+ static unsigned char *isa_image;
++/* Q8400 has no architectural YMM state. Keep each thread's upper 128 bits in software.
++ * The rewrite stub saves/restores all low XMM halves around the C emulator. */
++static _Thread_local uint8_t isa_ymm_hi[16][16];
+ 
+ void isa_emulate_set_image(unsigned char *image) { isa_image = image; }
+ 
+@@ -64,16 +69,319 @@ static uint64_t zf_sf(const IsaSite *site, uint64_t result) {
+     return (result == 0 ? ISA_ZF : 0) | (result >> (site->width - 1) & 1 ? ISA_SF : 0);
+ }
+ 
++static uint64_t load_bits(const IsaSite *site, const IsaRegs *regs, unsigned bits) {
++    unsigned char *at = effective_address(site, regs);
++    uint64_t value = 0;
++    __builtin_memcpy(&value, at, bits / 8);
++    return value;
++}
++
++static unsigned crc_source_bits(const IsaSite *site) {
++    int operand16 = 0, rex_w = 0;
++    unsigned opcode = 0;
++    for (unsigned i = 0; i < site->length; ++i) {
++        unsigned b = site->original[i];
++        if (b == 0x66) operand16 = 1;
++        if (b >= 0x40 && b <= 0x4f) rex_w = !!(b & 8);
++        if (b == 0xf0 || b == 0xf1) { opcode = b; break; }
++    }
++    if (opcode == 0xf0) return 8;
++    if (operand16) return 16;
++    return rex_w ? 64 : 32;
++}
++
++static void emulate_crc32(const IsaSite *site, IsaRegs *regs) {
++    unsigned bits = crc_source_bits(site);
++    uint64_t source;
++    if (site->src1 == ISA_NO_REG && site->mem_slot == ISA_MEM_SRC)
++        source = load_bits(site, regs, bits);
++    else
++        source = regs->gpr[site->src1] & (bits == 64 ? ~0ull : (1ull << bits) - 1);
++    uint32_t crc = (uint32_t)regs->gpr[site->dst];
++    for (unsigned i = 0; i < bits / 8; ++i) {
++        crc ^= (uint8_t)(source >> (i * 8));
++        for (unsigned bit = 0; bit < 8; ++bit)
++            crc = (crc >> 1) ^ (0x82f63b78u & (uint32_t)-(int32_t)(crc & 1));
++    }
++    /* CRC32 writes a 32-bit result and zero-extends it, even for a 64-bit destination. */
++    regs->gpr[site->dst] = crc;
++}
++
++static unsigned vex_info(const IsaSite *site, unsigned *map, unsigned *pp, unsigned *l,
++                         unsigned *opcode_at) {
++    if (site->length < 3) return 0;
++    if (site->original[0] == 0xc5) {
++        *map = 1;
++        *pp = site->original[1] & 3;
++        *l = (site->original[1] >> 2) & 1;
++        *opcode_at = 2;
++        return 1;
++    }
++    if (site->original[0] == 0xc4 && site->length >= 4) {
++        *map = site->original[1] & 0x1f;
++        *pp = site->original[2] & 3;
++        *l = (site->original[2] >> 2) & 1;
++        *opcode_at = 3;
++        return 1;
++    }
++    return 0;
++}
++
++static void read_vec_operand(const IsaSite *site, const IsaRegs *regs, unsigned op,
++                             unsigned bytes, uint8_t out[32]) {
++    uint8_t reg = op == 0 ? site->dst : op == 1 ? site->src1 : site->src2;
++    memset(out, 0, 32);
++    if (reg != ISA_NO_REG) {
++        memcpy(out, regs->xmm[reg], bytes < 16 ? bytes : 16);
++        if (bytes == 32) memcpy(out + 16, isa_ymm_hi[reg], 16);
++    } else if (site->mem_slot == (op == 0 ? 1 : 2)) {
++        __builtin_memcpy(out, effective_address(site, regs), bytes);
++    }
++}
++
++static void read_scalar_operand(const IsaSite *site, const IsaRegs *regs, unsigned op,
++                                unsigned lane_bytes, uint8_t out[8]) {
++    uint8_t reg = op == 0 ? site->dst : op == 1 ? site->src1 : site->src2;
++    memset(out, 0, 8);
++    if (reg != ISA_NO_REG) memcpy(out, regs->xmm[reg], lane_bytes);
++    else if (site->mem_slot == (op == 0 ? 1 : 2))
++        __builtin_memcpy(out, effective_address(site, regs), lane_bytes);
++}
++
++static void write_vec_dst(const IsaSite *site, IsaRegs *regs, unsigned bytes, const uint8_t value[32]) {
++    if (site->dst == ISA_NO_REG) {
++        if (site->mem_slot == ISA_MEM_DST)
++            __builtin_memcpy(effective_address(site, regs), value, bytes);
++        return;
++    }
++    memcpy(regs->xmm[site->dst], value, bytes < 16 ? bytes : 16);
++    if (bytes == 32) memcpy(isa_ymm_hi[site->dst], value + 16, 16);
++    else memset(isa_ymm_hi[site->dst], 0, 16); /* VEX.128 writes zero to YMM[255:128]. */
++}
++
++static void emulate_avx(const IsaSite *site, IsaRegs *regs) {
++    unsigned map = 0, pp = 0, l = 0, opcode_at = 0;
++    if (!vex_info(site, &map, &pp, &l, &opcode_at)) return;
++    unsigned opcode = site->original[opcode_at];
++    if (map == 1 && opcode == 0x77 && pp == 0) { /* VZEROUPPER / VZEROALL */
++        for (unsigned r = 0; r < 16; ++r) {
++            memset(isa_ymm_hi[r], 0, 16);
++            if (l) memset(regs->xmm[r], 0, 16);
++        }
++        return;
++    }
++    unsigned bytes = site->width == 255 ? 32 : site->width / 8;
++    if (bytes != 16 && bytes != 32) return;
++    uint8_t a[32], b[32], result[32];
++    memset(result, 0, sizeof result);
++    unsigned imm = site->length ? site->original[site->length - 1] : 0;
++
++    /* AVX/AVX2 instructions in the 0F3A map. */
++    if (map == 3 && pp == 1) {
++        if ((opcode == 0x06 || opcode == 0x46) && bytes == 32) { /* VPERM2F128 / VPERM2I128 */
++            read_vec_operand(site, regs, 1, 32, a);
++            read_vec_operand(site, regs, 2, 32, b);
++            const uint8_t *halves[4] = {a, a + 16, b, b + 16};
++            if (!(imm & 0x08)) memcpy(result, halves[imm & 3], 16);
++            if (!(imm & 0x80)) memcpy(result + 16, halves[(imm >> 4) & 3], 16);
++            write_vec_dst(site, regs, 32, result);
++            return;
++        }
++        if (opcode == 0x18 && bytes == 32) { /* VINSERTF128 */
++            read_vec_operand(site, regs, 1, 32, a);
++            read_vec_operand(site, regs, 2, 16, b);
++            memcpy(result, a, 32);
++            memcpy(result + ((imm & 1) ? 16 : 0), b, 16);
++            write_vec_dst(site, regs, 32, result);
++            return;
++        }
++        if (opcode == 0x19 && bytes == 32) { /* VEXTRACTF128 */
++            read_vec_operand(site, regs, 1, 32, a);
++            const uint8_t *half = a + ((imm & 1) ? 16 : 0);
++            if (site->dst == ISA_NO_REG) {
++                if (site->mem_slot == ISA_MEM_DST) __builtin_memcpy(effective_address(site, regs), half, 16);
++            } else {
++                memcpy(regs->xmm[site->dst], half, 16);
++                memset(isa_ymm_hi[site->dst], 0, 16);
++            }
++            return;
++        }
++        if ((opcode == 0x0c || opcode == 0x0d || opcode == 0x02) && bytes >= 16) { /* blends */
++            read_vec_operand(site, regs, 1, bytes, a);
++            read_vec_operand(site, regs, 2, bytes, b);
++            unsigned lane_bytes = opcode == 0x0d ? 8 : 4;
++            for (unsigned lane = 0; lane < bytes / lane_bytes; ++lane) {
++                const uint8_t *src = (imm & (1u << lane)) ? b : a;
++                memcpy(result + lane * lane_bytes, src + lane * lane_bytes, lane_bytes);
++            }
++            write_vec_dst(site, regs, bytes, result);
++            return;
++        }
++        return;
++    }
++    if (map != 1) return;
++
++    /* Unaligned moves only. Aligned VMOVAPS/VMOVAPD/VMOVDQA are intentionally not accepted. */
++    if (((opcode == 0x10 || opcode == 0x11) && (pp == 0 || pp == 1)) ||
++        ((opcode == 0x6f || opcode == 0x7f) && pp == 2)) {
++        if (opcode == 0x11 || opcode == 0x7f) {
++            read_vec_operand(site, regs, 1, bytes, a);
++            write_vec_dst(site, regs, bytes, a); /* dst==NO_REG means a memory store */
++        } else {
++            read_vec_operand(site, regs, 1, bytes, a);
++            write_vec_dst(site, regs, bytes, a);
++        }
++        return;
++    }
++
++    if (opcode == 0x50 && (pp == 0 || pp == 1)) { /* VMOVMSKPS / VMOVMSKPD */
++        read_vec_operand(site, regs, 1, bytes, a);
++        unsigned lane_bytes = pp == 0 ? 4 : 8;
++        uint32_t mask_bits = 0;
++        for (unsigned lane = 0; lane < bytes / lane_bytes; ++lane) {
++            uint64_t value = 0;
++            memcpy(&value, a + lane * lane_bytes, lane_bytes);
++            if (value & (1ull << (lane_bytes * 8 - 1))) mask_bits |= 1u << lane;
++        }
++        if (site->dst != ISA_NO_REG) regs->gpr[site->dst] = mask_bits;
++        return;
++    }
++    if (opcode == 0xd7 && pp == 1) { /* VPMOVMSKB (AVX2 for 256-bit operands) */
++        read_vec_operand(site, regs, 1, bytes, a);
++        uint32_t mask_bits = 0;
++        for (unsigned lane = 0; lane < bytes; ++lane)
++            if (a[lane] & 0x80) mask_bits |= 1u << lane;
++        if (site->dst != ISA_NO_REG) regs->gpr[site->dst] = mask_bits;
++        return;
++    }
++    if (opcode == 0xc6 && (pp == 0 || pp == 1)) { /* VSHUFPS / VSHUFPD */
++        read_vec_operand(site, regs, 1, bytes, a);
++        read_vec_operand(site, regs, 2, bytes, b);
++        if (pp == 0) {
++            for (unsigned block = 0; block < bytes / 16; ++block) {
++                unsigned base = block * 16;
++                for (unsigned lane = 0; lane < 4; ++lane) {
++                    unsigned sel = (imm >> (lane * 2)) & 3;
++                    const uint8_t *src = lane < 2 ? a : b;
++                    memcpy(result + base + lane * 4, src + base + sel * 4, 4);
++                }
++            }
++        } else {
++            for (unsigned block = 0; block < bytes / 16; ++block) {
++                unsigned base = block * 16;
++                unsigned sel_a = (imm >> (block * 2)) & 1;
++                unsigned sel_b = (imm >> (block * 2 + 1)) & 1;
++                memcpy(result + base, a + base + sel_a * 8, 8);
++                memcpy(result + base + 8, b + base + sel_b * 8, 8);
++            }
++        }
++        write_vec_dst(site, regs, bytes, result);
++        return;
++    }
++    if (opcode == 0x70 && pp == 1) { /* VPSHUFD */
++        read_vec_operand(site, regs, 1, bytes, a);
++        for (unsigned block = 0; block < bytes / 16; ++block) {
++            unsigned base = block * 16;
++            for (unsigned lane = 0; lane < 4; ++lane) {
++                unsigned sel = (imm >> (lane * 2)) & 3;
++                memcpy(result + base + lane * 4, a + base + sel * 4, 4);
++            }
++        }
++        write_vec_dst(site, regs, bytes, result);
++        return;
++    }
++
++    if (opcode == 0x54 || opcode == 0x55 || opcode == 0x56 || opcode == 0x57) {
++        read_vec_operand(site, regs, 1, bytes, a);
++        read_vec_operand(site, regs, 2, bytes, b);
++        for (unsigned i = 0; i < bytes; ++i) {
++            if (opcode == 0x54) result[i] = a[i] & b[i];
++            else if (opcode == 0x55) result[i] = (uint8_t)~a[i] & b[i];
++            else if (opcode == 0x56) result[i] = a[i] | b[i];
++            else result[i] = a[i] ^ b[i];
++        }
++        write_vec_dst(site, regs, bytes, result);
++        return;
++    }
++
++    /* Packed floating-point arithmetic. The stub preserves guest XMM state, so baseline SSE2
++     * scalar arithmetic used by this routine cannot leak into guest registers. */
++    if (opcode == 0x58 || opcode == 0x5c || opcode == 0x59 || opcode == 0x5e) {
++        read_vec_operand(site, regs, 1, bytes, a);
++        if ((pp == 2 || pp == 3) && bytes == 16) {
++            unsigned lane = pp == 2 ? 4 : 8;
++            read_scalar_operand(site, regs, 2, lane, b);
++        } else {
++            read_vec_operand(site, regs, 2, bytes, b);
++        }
++        if (pp == 0) {
++            for (unsigned i = 0; i < bytes / 4; ++i) {
++                float x, y, z;
++                memcpy(&x, a + i * 4, 4); memcpy(&y, b + i * 4, 4);
++                if (opcode == 0x58) z = x + y;
++                else if (opcode == 0x5c) z = x - y;
++                else if (opcode == 0x59) z = x * y;
++                else z = x / y;
++                memcpy(result + i * 4, &z, 4);
++            }
++        } else if (pp == 1) {
++            for (unsigned i = 0; i < bytes / 8; ++i) {
++                double x, y, z;
++                memcpy(&x, a + i * 8, 8); memcpy(&y, b + i * 8, 8);
++                if (opcode == 0x58) z = x + y;
++                else if (opcode == 0x5c) z = x - y;
++                else if (opcode == 0x59) z = x * y;
++                else z = x / y;
++                memcpy(result + i * 8, &z, 8);
++            }
++        } else if ((pp == 2 || pp == 3) && bytes == 16) {
++            unsigned lane = pp == 2 ? 4 : 8;
++            if (pp == 2) {
++                float x, y, z; memcpy(&x, a, 4); memcpy(&y, b, 4);
++                if (opcode == 0x58) z = x + y; else if (opcode == 0x5c) z = x - y;
++                else if (opcode == 0x59) z = x * y; else z = x / y;
++                memcpy(result, &z, 4);
++            } else {
++                double x, y, z; memcpy(&x, a, 8); memcpy(&y, b, 8);
++                if (opcode == 0x58) z = x + y; else if (opcode == 0x5c) z = x - y;
++                else if (opcode == 0x59) z = x * y; else z = x / y;
++                memcpy(result, &z, 8);
++            }
++            memcpy(result + lane, a + lane, 16 - lane); /* scalar forms preserve src1's upper lanes */
++        } else return;
++        write_vec_dst(site, regs, bytes, result);
++        return;
++    }
++}
++
+ uint64_t isa_defined_flags(uint8_t kind) {
+     switch (kind) {
+     case ISA_ANDN: case ISA_BLSI: case ISA_BLSMSK: case ISA_BLSR: return ISA_SF | ISA_ZF | ISA_CF | ISA_OF;
+     case ISA_BEXTR: return ISA_ZF | ISA_CF | ISA_OF;
+     case ISA_LZCNT: case ISA_TZCNT: return ISA_CF | ISA_ZF;
++    case ISA_POPCNT: return ISA_CF | ISA_PF | ISA_AF | ISA_ZF | ISA_SF | ISA_OF;
+     default: return 0;
+     }
+ }
+ 
+ void ABI isa_emulate(const IsaSite *site, IsaRegs *regs) {
++    /* Vector widths use 128/255 sentinels and must never enter the scalar width-mask path. */
++    if (site->kind == ISA_AVX) { emulate_avx(site, regs); return; }
++    if (site->kind == ISA_CRC32) { emulate_crc32(site, regs); return; }
++    if (site->kind == ISA_SSE42_UNSUPPORTED) return; /* fail closed if a malformed table reaches here */
++    if (site->kind == ISA_PCMPGTQ) {
++        uint8_t a[32], b[32], result[16];
++        read_vec_operand(site, regs, 0, 16, a);
++        read_vec_operand(site, regs, 1, 16, b);
++        for (unsigned i = 0; i < 2; ++i) {
++            int64_t x, y;
++            memcpy(&x, a + i * 8, 8); memcpy(&y, b + i * 8, 8);
++            uint64_t lane = x > y ? ~0ull : 0ull;
++            memcpy(result + i * 8, &lane, 8);
++        }
++        if (site->dst != ISA_NO_REG) memcpy(regs->xmm[site->dst], result, 16);
++        return; /* Legacy SSE4.2 preserves the YMM upper halves. */
++    }
+     uint64_t mask = width_mask(site), defined = isa_defined_flags(site->kind);
+     uint64_t width = site->width, source, result, flags;
+     switch (site->kind) {
+@@ -81,6 +389,12 @@ void ABI isa_emulate(const IsaSite *site, IsaRegs *regs) {
+     case ISA_MOVBE_STORE:
+         write_dst(site, regs, byte_swap(site, read_operand(site, regs, site->src1)));
+         return;
++    case ISA_POPCNT: {
++        source = read_operand(site, regs, site->src1);
++        result = (uint64_t)__builtin_popcountll(source & mask);
++        flags = source == 0 ? ISA_ZF : 0;
++        break;
++    }
+     case ISA_LZCNT:
+     case ISA_TZCNT:
+         source = read_operand(site, regs, site->src1);
+diff --git a/src/isa_emulate.h b/src/isa_emulate.h
+index cd85c5b..b95ff2c 100644
+--- a/src/isa_emulate.h
++++ b/src/isa_emulate.h
+@@ -1,8 +1,6 @@
+-/* Emulation of the guest's MOVBE, BMI1 and LZCNT instructions for hosts that lack them (Sandy
+- * Bridge and Ivy Bridge, issue #31). Each BBISA1 record (scripts/isa_rewrite.py) describes one
+- * instruction site; a stub calls isa_emulate with the guest's registers. Built with
+- * -mgeneral-regs-only and no libc: it runs inside guest code and must leave the XMM/YMM
+- * registers untouched. */
++/* Emulation of selected guest ISA instructions on older hosts. Each BBISA1 record describes one
++ * instruction site; the stub saves GPR/XMM state and calls isa_emulate. YMM upper halves are
++ * software-shadowed per thread. Unimplemented AVX/SSE4.2 sites are marked unsupported by scanner. */
+ #ifndef BB_ISA_EMULATE_H
+ #define BB_ISA_EMULATE_H
+ #include <stdint.h>
+@@ -10,7 +8,7 @@
+ #define ABI __attribute__((sysv_abi))
+ #endif
+ 
+-enum { ISA_MOVBE_LOAD = 1, ISA_MOVBE_STORE, ISA_LZCNT, ISA_TZCNT, ISA_ANDN, ISA_BEXTR, ISA_BLSI, ISA_BLSMSK, ISA_BLSR, ISA_VCVTPH2PS, ISA_VCVTPS2PH };
++enum { ISA_MOVBE_LOAD = 1, ISA_MOVBE_STORE, ISA_LZCNT, ISA_TZCNT, ISA_ANDN, ISA_BEXTR, ISA_BLSI, ISA_BLSMSK, ISA_BLSR, ISA_VCVTPH2PS, ISA_VCVTPS2PH, ISA_POPCNT, ISA_AVX, ISA_CRC32, ISA_SSE42_UNSUPPORTED, ISA_PCMPGTQ };
+ enum { ISA_MODE_JMP = 0, ISA_MODE_JMP_RELOCATE, ISA_MODE_INT3, ISA_MODE_UNSUPPORTED };
+ enum { ISA_NO_REG = 0xff, ISA_MEM_NONE = 0, ISA_MEM_DST = 1, ISA_MEM_SRC = 2, ISA_MEM_RIP_RELATIVE = 1 };
+ typedef struct {                       /* one BBISA1 record (spec 4.4), as stored in the file */
+@@ -24,11 +22,17 @@ typedef struct {                       /* one BBISA1 record (spec 4.4), as store
+     uint8_t reserved2;
+ } IsaSite;
+ _Static_assert(sizeof(IsaSite) == 64, "BBISA1 record");
+-typedef struct { uint64_t rflags; uint64_t gpr[16]; } IsaRegs;   /* gpr: x86 numbering; gpr[4] = guest rsp */
+-enum { ISA_CF = 1u << 0, ISA_ZF = 1u << 6, ISA_SF = 1u << 7, ISA_OF = 1u << 11 };
++typedef struct {
++    uint64_t rflags;
++    uint64_t gpr[16];             /* x86 numbering; gpr[4] = guest rsp */
++    uint8_t xmm[16][16];          /* low 128 bits saved by the rewrite stub */
++    uint32_t mxcsr;               /* signal-trap path: preserve FP status changes */
++    uint32_t reserved;
++} IsaRegs;
++enum { ISA_CF = 1u << 0, ISA_PF = 1u << 2, ISA_AF = 1u << 4, ISA_ZF = 1u << 6, ISA_SF = 1u << 7, ISA_OF = 1u << 11 };
+ /* Memory operands with mem_flags & ISA_MEM_RIP_RELATIVE address image + disp. */
+ void isa_emulate_set_image(unsigned char *image);
+-/* Executes the site's instruction on regs (spec 5.6). */
++/* Executes the site's instruction on regs (spec 5.6). AVX upper halves are thread-local shadow state. */
+ void ABI isa_emulate(const IsaSite *site, IsaRegs *regs);
+ /* Flags the instruction defines (the test compares only these). */
+ uint64_t isa_defined_flags(uint8_t kind);
+diff --git a/src/isa_rewrite.c b/src/isa_rewrite.c
+index 3ce4ce9..d27a9d6 100644
+--- a/src/isa_rewrite.c
++++ b/src/isa_rewrite.c
+@@ -71,19 +71,21 @@ static uint32_t read_u32(const unsigned char *p) {
+ static int register_valid(uint8_t reg) { return reg <= 15 || reg == ISA_NO_REG; }
+ 
+ /* Field ranges of spec 4.4, plus what the patch writes: a 5-byte jmp needs a 5-byte site (mode 0)
+- * or a relocated instruction (mode 1), an int3 site is 4 bytes, and every write stays inside the image.
++ * or a relocated instruction (mode 1), an int3 site is 1-4 bytes, and every write stays inside the image.
+  * The writer stores scale 0 without a memory operand, else iced's scale (1 when there is no index). */
+ static int record_valid(const IsaSite *s, uint64_t image_size) {
+-    if (s->length < 4 || s->length > 15 || s->relocated_length > 15) return 0;
+-    if (s->kind < ISA_MOVBE_LOAD || s->kind > ISA_VCVTPS2PH || s->mode > ISA_MODE_UNSUPPORTED) return 0;
++    if (s->length < 1 || s->length > 15 || s->relocated_length > 15) return 0;
++    if (s->kind < ISA_MOVBE_LOAD || s->kind > ISA_PCMPGTQ || s->mode > ISA_MODE_UNSUPPORTED) return 0;
+     if (!register_valid(s->dst) || !register_valid(s->src1) || !register_valid(s->src2) || !register_valid(s->base) ||
+         !register_valid(s->index) || s->mem_slot > ISA_MEM_SRC)
+         return 0;
+-    if (s->kind <= ISA_BLSR && s->width != 16 && s->width != 32 && s->width != 64) return 0;
++    if ((s->kind <= ISA_BLSR || s->kind == ISA_POPCNT || s->kind == ISA_CRC32) &&
++        s->width != 16 && s->width != 32 && s->width != 64) return 0;
++    if (s->kind == ISA_AVX && s->width != 0 && s->width != 128 && s->width != 255) return 0;
+     if (s->scale != 1 && s->scale != 2 && s->scale != 4 && s->scale != 8 && !(s->scale == 0 && s->index == ISA_NO_REG))
+         return 0;
+     if (s->mode == ISA_MODE_JMP && s->length < JMP_BYTES) return 0;
+-    if (s->mode == ISA_MODE_INT3 && s->length != 4) return 0;
++    if (s->mode == ISA_MODE_INT3 && s->length > 4) return 0;
+     if (s->mode == ISA_MODE_JMP_RELOCATE && (s->length != 4 || s->relocated_length == 0)) return 0;
+     uint64_t end = s->mode == ISA_MODE_JMP_RELOCATE ? 4u + s->relocated_length : s->length;
+     return s->offset <= image_size && end <= image_size - s->offset;
+@@ -149,6 +151,9 @@ unsigned isa_site_set(const IsaSite *s) {
+     case ISA_LZCNT: return CPU_SET_LZCNT;
+     case ISA_TZCNT: case ISA_ANDN: case ISA_BEXTR: case ISA_BLSI: case ISA_BLSMSK: case ISA_BLSR: return CPU_SET_BMI1;
+     case ISA_VCVTPH2PS: case ISA_VCVTPS2PH: return CPU_SET_F16C;
++    case ISA_POPCNT: return CPU_SET_POPCNT;
++    case ISA_AVX: return CPU_SET_AVX;
++    case ISA_CRC32: case ISA_SSE42_UNSUPPORTED: case ISA_PCMPGTQ: return CPU_SET_SSE42;
+     default: return 0;
+     }
+ }
+@@ -186,13 +191,20 @@ static int rel32_to(const unsigned char *next, const unsigned char *target, int3
+  * jmp back is out of rel32 range. */
+ static size_t emit_stub(unsigned char *code, const unsigned char *at, const IsaSite *s, uint64_t *hit,
+                         unsigned char *image) {
+-    static const uint8_t lea_rsp_down[] = {0x48, 0x8d, 0xa4, 0x24, 0x00, 0xff, 0xff, 0xff};   /* lea rsp,[rsp-0x100] */
+-    static const uint8_t lea_rax_rsp_up[] = {0x48, 0x8d, 0x84, 0x24, 0x00, 0x01, 0x00, 0x00}; /* lea rax,[rsp+0x100] */
+-    static const uint8_t lea_rsp_up[] = {0x48, 0x8d, 0xa4, 0x24, 0x00, 0x01, 0x00, 0x00};     /* lea rsp,[rsp+0x100] */
++    static const uint8_t lea_rsp_down[] = {0x48, 0x8d, 0xa4, 0x24, 0x00, 0xfd, 0xff, 0xff};   /* lea rsp,[rsp-0x300] */
++    static const uint8_t lea_rax_rsp_up[] = {0x48, 0x8d, 0x84, 0x24, 0x00, 0x03, 0x00, 0x00}; /* lea rax,[rsp+0x300] */
++    static const uint8_t lea_rsp_up[] = {0x48, 0x8d, 0xa4, 0x24, 0x00, 0x03, 0x00, 0x00};     /* lea rsp,[rsp+0x300] */
+     unsigned char *p = code;
+     emit_bytes(&p, lea_rsp_down, sizeof lea_rsp_down);
+     for (int reg = 0; reg < 16; reg++)
+         if (reg != 4) emit_mov_store(&p, reg, (uint8_t)(8 * reg));
++    /* Save the guest's low XMM halves before C is allowed to use SSE2 for scalar emulation. */
++    for (int reg = 0; reg < 16; reg++) {
++        emit_u8(&p, 0xf3);
++        if (reg >= 8) emit_u8(&p, 0x44); /* REX.R extends the XMM register number */
++        emit_bytes(&p, (const uint8_t[]){0x0f, 0x7f, (uint8_t)(0x84 | ((reg & 7) << 3)), 0x24}, 4);
++        emit_u32(&p, (uint32_t)(128 + 16 * reg));
++    }
+     emit_bytes(&p, lea_rax_rsp_up, sizeof lea_rax_rsp_up);
+     emit_mov_store(&p, 0, 8 * 4);                                   /* gpr[4] = guest rsp */
+     emit_u8(&p, 0x9c);                                              /* pushfq: rsp = IsaRegs* */
+@@ -211,6 +223,13 @@ static size_t emit_stub(unsigned char *code, const unsigned char *at, const IsaS
+     emit_u8(&p, 0x9d);                                              /* popfq: rsp = &gpr[0] */
+     for (int reg = 0; reg < 16; reg++)
+         if (reg != 4) emit_mov_load(&p, reg, (uint8_t)(8 * reg));
++    /* Restore low XMM halves; AVX upper halves live in the per-thread software shadow. */
++    for (int reg = 0; reg < 16; reg++) {
++        emit_u8(&p, 0xf3);
++        if (reg >= 8) emit_u8(&p, 0x44);
++        emit_bytes(&p, (const uint8_t[]){0x0f, 0x6f, (uint8_t)(0x84 | ((reg & 7) << 3)), 0x24}, 4);
++        emit_u32(&p, (uint32_t)(128 + 16 * reg));
++    }
+     emit_bytes(&p, lea_rsp_up, sizeof lea_rsp_up);
+     const unsigned char *back = image + s->offset + s->length;
+     if (s->mode == ISA_MODE_JMP_RELOCATE) {
+@@ -277,7 +296,7 @@ IsaReport isa_rewrite_apply(IsaTable *t, unsigned char *image, unsigned char *st
+             continue;
+         }
+         if (size > ISA_STUB_BYTES) {
+-            fprintf(stderr, "ISA: stub for site 0x%llx exceeds 256 bytes, site skipped\n",
++            fprintf(stderr, "ISA: stub for site 0x%llx exceeds ISA_STUB_BYTES, site skipped\n",
+                     (unsigned long long)s->offset);
+             report.skipped++;
+             continue;
+@@ -317,8 +336,8 @@ int isa_rewrite_site_of_stub(const IsaTable *t, uintptr_t rip) {
+ }
+ 
+ const char *isa_kind_name(uint8_t kind) {
+-    static const char *const names[] = {"?",     "movbe", "movbe",  "lzcnt", "tzcnt",     "andn",
+-                                        "bextr", "blsi",  "blsmsk", "blsr",  "vcvtph2ps", "vcvtps2ph"};
++    static const char *const names[] = {"?", "movbe", "movbe", "lzcnt", "tzcnt", "andn", "bextr", "blsi",
++        "blsmsk", "blsr", "vcvtph2ps", "vcvtps2ph", "popcnt", "avx", "crc32", "sse4.2-unsupported", "pcmpgtq"};
+     return kind < sizeof names / sizeof names[0] ? names[kind] : "?";
+ }
+ 
+diff --git a/src/isa_rewrite.h b/src/isa_rewrite.h
+index 3cff4bb..74cad33 100644
+--- a/src/isa_rewrite.h
++++ b/src/isa_rewrite.h
+@@ -18,7 +18,7 @@ typedef struct {
+ } IsaTable;
+ /* rewritten = jmp + relocated + int3; skipped and unsupported_needed are outside it. */
+ typedef struct { uint32_t rewritten, jmp, relocated, int3, skipped, unsupported_needed; } IsaReport;
+-enum { ISA_STUB_BYTES = 256 };
++enum { ISA_STUB_BYTES = 640 };
+ 
+ /* Parses a BBISA1 file (spec 4.4). NULL and one stderr line ("ISA: <reason>") when invalid. */
+ IsaTable *isa_table_load(const char *path);
+diff --git a/src/probe.c b/src/probe.c
+index f8f9c5e..dce0a90 100644
+--- a/src/probe.c
++++ b/src/probe.c
+@@ -159,6 +159,15 @@ __asm__(".text\n.globl enter_on_stack\nenter_on_stack:\n"
+         " mov %rbp,%rsp\n pop %rbp\n ret\n");
+ #endif
+ static ABI void guest_exit(void) { puts("Runtime: process finalizer callback reached"); }
++static uint32_t isa_read_mxcsr(void) {
++    uint32_t value;
++    __asm__ volatile("stmxcsr %0" : "=m"(value));
++    return value;
++}
++static void isa_write_mxcsr(uint32_t value) {
++    __asm__ volatile("ldmxcsr %0" : : "m"(value));
++}
++
+ #ifdef _WIN32
+ static void describe_address(char *out, size_t size, uintptr_t address) {
+     HMODULE module=NULL;
+@@ -178,12 +187,19 @@ static void describe_address(char *out, size_t size, uintptr_t address) {
+     }
+     snprintf(out,size,"%p",(void *)address);
+ }
+-/* CONTEXT <-> IsaRegs (gpr in x86 numbering). */
++/* CONTEXT <-> IsaRegs. The low XMM halves are required by the AVX software emulator;
++ * the upper YMM halves live in thread-local shadow state. */
+ static void isa_context_regs(CONTEXT *c, IsaRegs *regs, int to_context) {
+     DWORD64 *g[16]={&c->Rax,&c->Rcx,&c->Rdx,&c->Rbx,&c->Rsp,&c->Rbp,&c->Rsi,&c->Rdi,
+                     &c->R8,&c->R9,&c->R10,&c->R11,&c->R12,&c->R13,&c->R14,&c->R15};
+-    for (int i=0;i<16;++i) { if (to_context) *g[i]=regs->gpr[i]; else regs->gpr[i]=*g[i]; }
++    M128A *x[16]={&c->Xmm0,&c->Xmm1,&c->Xmm2,&c->Xmm3,&c->Xmm4,&c->Xmm5,&c->Xmm6,&c->Xmm7,
++                  &c->Xmm8,&c->Xmm9,&c->Xmm10,&c->Xmm11,&c->Xmm12,&c->Xmm13,&c->Xmm14,&c->Xmm15};
++    for (int i=0;i<16;++i) {
++        if (to_context) *g[i]=regs->gpr[i]; else regs->gpr[i]=*g[i];
++        if (to_context) memcpy(x[i], regs->xmm[i], 16); else memcpy(regs->xmm[i], x[i], 16);
++    }
+     if (to_context) c->EFlags=(DWORD)regs->rflags; else regs->rflags=c->EFlags;
++    if (to_context) c->MxCsr=regs->mxcsr; else regs->mxcsr=c->MxCsr;
+ }
+ const char *runtime_thread_current_name(void);
+ static int fatal_reported;
+@@ -270,7 +286,9 @@ static LONG CALLBACK vectored_fault(EXCEPTION_POINTERS *info) {
+         IsaRegs regs;
+         uintptr_t rip;
+         isa_context_regs(info->ContextRecord,&regs,0);
++        isa_write_mxcsr(regs.mxcsr);
+         if (isa_rewrite_trap(isa_table,(uintptr_t)record->ExceptionAddress,&regs,&rip)) {
++            regs.mxcsr=isa_read_mxcsr();
+             isa_context_regs(info->ContextRecord,&regs,1);
+             info->ContextRecord->Rip=(DWORD64)rip;
+             return EXCEPTION_CONTINUE_EXECUTION;
+@@ -336,9 +354,24 @@ static void fault(int sig, siginfo_t *info, void *context) {
+         uintptr_t rip;
+         for (int i = 0; i < 16; ++i) regs.gpr[i] = (uint64_t)g[isa_gregs[i]];
+         regs.rflags = (uint64_t)g[REG_EFL];
++        /* Linux x86-64 signal frames use the FXSAVE-compatible fpstate for XMM0-XMM15. */
++        struct _libc_fpstate *fp = ((ucontext_t *)context)->uc_mcontext.fpregs;
++        if (fp) {
++            memcpy(regs.xmm, fp->_xmm, sizeof regs.xmm);
++            regs.mxcsr = fp->mxcsr;
++            isa_write_mxcsr(regs.mxcsr);
++        } else {
++            memset(regs.xmm, 0, sizeof regs.xmm);
++            regs.mxcsr = isa_read_mxcsr();
++        }
+         if (isa_rewrite_trap(isa_table, (uintptr_t)g[REG_RIP] - 1, &regs, &rip)) {
++            regs.mxcsr = isa_read_mxcsr();
+             for (int i = 0; i < 16; ++i) g[isa_gregs[i]] = (greg_t)regs.gpr[i];
+             g[REG_EFL] = (greg_t)regs.rflags;
++            if (fp) {
++                memcpy(fp->_xmm, regs.xmm, sizeof regs.xmm);
++                fp->mxcsr = regs.mxcsr;
++            }
+             g[REG_RIP] = (greg_t)rip;
+             return;
+         }
+diff --git a/tests/test_isa_emulate.c b/tests/test_isa_emulate.c
+new file mode 100644
+index 0000000..0f45dc8
+--- /dev/null
++++ b/tests/test_isa_emulate.c
+@@ -0,0 +1,112 @@
++/* Standalone smoke tests for the older-CPU ISA emulator. Build with:
++ *   cc -std=c11 -O2 -Wall -Wextra -Werror -mno-avx -mno-avx2 src/isa_emulate.c tests/test_isa_emulate.c -o /tmp/test-isa && /tmp/test-isa
++ */
++#include <assert.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <string.h>
++#include "../src/isa_emulate.h"
++
++static IsaSite make_site(uint8_t kind, uint8_t width, uint8_t dst, uint8_t src1, uint8_t src2,
++                         uint8_t mem_slot, uint8_t base, const unsigned char *bytes, uint8_t length) {
++    IsaSite s;
++    memset(&s, 0, sizeof s);
++    s.kind = kind; s.width = width; s.dst = dst; s.src1 = src1; s.src2 = src2;
++    s.mem_slot = mem_slot; s.base = base; s.index = ISA_NO_REG; s.scale = 1;
++    s.length = length; memcpy(s.original, bytes, length);
++    return s;
++}
++
++int main(void) {
++    IsaRegs r; memset(&r, 0, sizeof r);
++    const unsigned char vzero_upper[] = {0xc5, 0xf8, 0x77};
++    r.xmm[0][0] = 0x5a;
++    IsaSite s = make_site(ISA_AVX, 0, ISA_NO_REG, ISA_NO_REG, ISA_NO_REG, 0, ISA_NO_REG, vzero_upper, 3);
++    isa_emulate(&s, &r);
++    assert(r.xmm[0][0] == 0x5a); /* VZEROUPPER preserves the low XMM half. */
++    const unsigned char vzero_all[] = {0xc5, 0xfc, 0x77};
++    s = make_site(ISA_AVX, 0, ISA_NO_REG, ISA_NO_REG, ISA_NO_REG, 0, ISA_NO_REG, vzero_all, 3);
++    isa_emulate(&s, &r);
++    for (int i = 0; i < 16; ++i) assert(r.xmm[0][i] == 0);
++
++    const unsigned char vxor[] = {0xc5, 0xf0, 0x57, 0xc2}; /* vxorps xmm0,xmm1,xmm2 */
++    for (int i = 0; i < 16; ++i) { r.xmm[1][i] = (uint8_t)(i * 3); r.xmm[2][i] = (uint8_t)(0xf0 + i); }
++    s = make_site(ISA_AVX, 128, 0, 1, 2, 0, ISA_NO_REG, vxor, 4);
++    isa_emulate(&s, &r);
++    for (int i = 0; i < 16; ++i) assert(r.xmm[0][i] == ((uint8_t)(i * 3) ^ (uint8_t)(0xf0 + i)));
++
++    /* VSHUFPS xmm0,xmm1,xmm2,1Bh selects lanes 3,2 from src1 and 1,0 from src2. */
++    float shuf_a[4] = {1,2,3,4}, shuf_b[4] = {10,20,30,40}, shuf_out[4] = {0};
++    memcpy(r.xmm[1], shuf_a, 16); memcpy(r.xmm[2], shuf_b, 16);
++    const unsigned char vshufps[] = {0xc5, 0xf0, 0xc6, 0xc2, 0x1b};
++    s = make_site(ISA_AVX, 128, 0, 1, 2, 0, ISA_NO_REG, vshufps, 5); isa_emulate(&s, &r);
++    memcpy(shuf_out, r.xmm[0], 16);
++    assert(shuf_out[0] == 4 && shuf_out[1] == 3 && shuf_out[2] == 20 && shuf_out[3] == 10);
++
++    /* VMOVMSKPS extracts the sign bits of four float lanes into a zero-extended GPR. */
++    uint32_t signs[4] = {0x80000000u, 0, 0x80000000u, 0};
++    memcpy(r.xmm[1], signs, 16);
++    const unsigned char vmovmskps[] = {0xc5, 0xf8, 0x50, 0xc1};
++    s = make_site(ISA_AVX, 128, 0, 1, ISA_NO_REG, 0, ISA_NO_REG, vmovmskps, 4); isa_emulate(&s, &r);
++    assert(r.gpr[0] == 5);
++
++    /* VADDSS changes only lane 0 and copies the upper XMM lanes from src1. */
++    float scalar_a[4] = {1.25f, 2.0f, 3.0f, 4.0f}, scalar_b[4] = {2.5f, 20.0f, 30.0f, 40.0f}, scalar_out[4];
++    memcpy(r.xmm[1], scalar_a, 16); memcpy(r.xmm[2], scalar_b, 16);
++    const unsigned char vaddss[] = {0xc5, 0xf2, 0x58, 0xc2};
++    s = make_site(ISA_AVX, 128, 0, 1, 2, 0, ISA_NO_REG, vaddss, 4); isa_emulate(&s, &r);
++    memcpy(scalar_out, r.xmm[0], 16);
++    assert(scalar_out[0] == 3.75f && scalar_out[1] == 2.0f && scalar_out[2] == 3.0f && scalar_out[3] == 4.0f);
++
++    /* Load two YMM vectors from memory, add them, and store: checks the software upper halves. */
++    unsigned char mem[96]; memset(mem, 0, sizeof mem);
++    float a[8] = {1,2,3,4,5,6,7,8}, b[8] = {10,20,30,40,50,60,70,80}, out[8] = {0};
++    memcpy(mem, a, sizeof a); memcpy(mem + 32, b, sizeof b);
++    r.gpr[0] = (uintptr_t)mem;
++    const unsigned char vmov_load1[] = {0xc5, 0xfc, 0x10, 0x08}; /* vmovups ymm1,[rax] */
++    s = make_site(ISA_AVX, 255, 1, ISA_NO_REG, ISA_NO_REG, 2, 0, vmov_load1, 4); isa_emulate(&s, &r);
++    const unsigned char vmov_load2[] = {0xc5, 0xfc, 0x10, 0x50, 0x20}; /* vmovups ymm2,[rax+20h] */
++    s = make_site(ISA_AVX, 255, 2, ISA_NO_REG, ISA_NO_REG, 2, 0, vmov_load2, 5); s.disp = 32; isa_emulate(&s, &r);
++    const unsigned char vadd[] = {0xc5, 0xf4, 0x58, 0xc2}; /* vaddps ymm0,ymm1,ymm2 */
++    s = make_site(ISA_AVX, 255, 0, 1, 2, 0, ISA_NO_REG, vadd, 4); isa_emulate(&s, &r);
++    const unsigned char vmov_store[] = {0xc5, 0xfc, 0x11, 0x00}; /* vmovups [rax],ymm0 */
++    s = make_site(ISA_AVX, 255, ISA_NO_REG, 0, ISA_NO_REG, 1, 0, vmov_store, 4); isa_emulate(&s, &r);
++    memcpy(out, mem, sizeof out);
++    for (int i = 0; i < 8; ++i) assert(out[i] == a[i] + b[i]);
++
++    /* VPERM2F128 ymm0,ymm1,ymm2,1 selects src1's high half for low and src1 low for high. */
++    const unsigned char vperm2f128[] = {0xc4, 0xe3, 0x75, 0x06, 0xc2, 0x01};
++    s = make_site(ISA_AVX, 255, 0, 1, 2, 0, ISA_NO_REG, vperm2f128, 6); isa_emulate(&s, &r);
++    const unsigned char vmov_store2[] = {0xc5, 0xfc, 0x11, 0x00};
++    s = make_site(ISA_AVX, 255, ISA_NO_REG, 0, ISA_NO_REG, 1, 0, vmov_store2, 4); isa_emulate(&s, &r);
++    float perm_out[8]; memcpy(perm_out, mem, sizeof perm_out);
++    assert(perm_out[0] == 5 && perm_out[1] == 6 && perm_out[2] == 7 && perm_out[3] == 8);
++    assert(perm_out[4] == 1 && perm_out[5] == 2 && perm_out[6] == 3 && perm_out[7] == 4);
++
++    /* CRC32C byte operation, CRC=0 and source byte '1'. */
++    const unsigned char crc32[] = {0xf2, 0x0f, 0x38, 0xf0, 0xc1};
++    r.gpr[0] = 0; r.gpr[1] = '1';
++    s = make_site(ISA_CRC32, 32, 0, 1, ISA_NO_REG, 0, ISA_NO_REG, crc32, 5);
++    isa_emulate(&s, &r);
++    assert((uint32_t)r.gpr[0] == 0xc288cab2u);
++
++    /* PCMPGTQ compares signed 64-bit lanes and writes all-ones/zero masks. */
++    int64_t q1[2] = {5, -2}, q2[2] = {4, -1};
++    const unsigned char pcmpgtq[] = {0x66, 0x0f, 0x38, 0x37, 0xc1};
++    memcpy(r.xmm[0], q1, 16); memcpy(r.xmm[1], q2, 16);
++    s = make_site(ISA_PCMPGTQ, 128, 0, 1, ISA_NO_REG, 0, ISA_NO_REG, pcmpgtq, 5);
++    isa_emulate(&s, &r);
++    uint64_t qresult[2]; memcpy(qresult, r.xmm[0], 16);
++    assert(qresult[0] == ~0ull && qresult[1] == 0);
++
++    /* POPCNT updates ZF from the source and clears all other architecturally defined flags. */
++    const unsigned char popcnt[] = {0xf3, 0x0f, 0xb8, 0xc1};
++    s = make_site(ISA_POPCNT, 32, 0, 1, ISA_NO_REG, 0, ISA_NO_REG, popcnt, 4);
++    r.gpr[1] = 0xf0; r.rflags = ~0ull; isa_emulate(&s, &r);
++    assert(r.gpr[0] == 4 && !(r.rflags & ISA_ZF));
++    r.gpr[1] = 0; isa_emulate(&s, &r);
++    assert(r.gpr[0] == 0 && (r.rflags & ISA_ZF));
++
++    puts("ISA emulator tests: PASS");
++    return 0;
++}
+diff --git a/tests/test_isa_rewrite.py b/tests/test_isa_rewrite.py
+index d91b00d..f0c4196 100644
+--- a/tests/test_isa_rewrite.py
++++ b/tests/test_isa_rewrite.py
+@@ -25,7 +25,7 @@ class ScanSegmentTests(unittest.TestCase):
+     def test_summary_counts_sets_and_modes(self):
+         sites = self.scan(isa_rewrite.fixture_code())
+         self.assertEqual(isa_rewrite.summary(sites),
+-                         'ISA: 6 sites (MOVBE 2, BMI1 3, LZCNT 1, F16C 0); 1 relocated, 1 int3, 0 unsupported')
++                         'ISA: 6 sites (MOVBE 2, BMI1 3, LZCNT 1, F16C 0, POPCNT 0, AVX 0, SSE4.2 0); 1 relocated, 1 int3, 0 unsupported')
+ 
+     def test_widths_and_relocated_bytes(self):
+         sites = self.scan(isa_rewrite.fixture_code())
+@@ -55,6 +55,41 @@ class ScanSegmentTests(unittest.TestCase):
+         self.assertEqual((site.kind, site.mode),
+                          (isa_rewrite.KIND_VCVTPS2PH, isa_rewrite.MODE_UNSUPPORTED))
+ 
++    def test_popcnt_is_rewritable(self):
++        sites = self.scan(bytes.fromhex('f30fb8c1'))  # popcnt eax, ecx
++        site, = sites
++        self.assertEqual((site.kind, site.width, site.mode),
++                         (isa_rewrite.KIND_POPCNT, 32, isa_rewrite.MODE_INT3))
++
++    def test_avx_zero_upper_is_detected(self):
++        # vzeroupper: C5 F8 77. This instruction is 3 bytes and must use INT3 safely.
++        site, = self.scan(bytes.fromhex('c5f877'))
++        self.assertEqual((site.kind, site.width, site.mode),
++                         (isa_rewrite.KIND_AVX, 0, isa_rewrite.MODE_INT3))
++
++    def test_avx_xor_is_rewritten(self):
++        # vxorps xmm0, xmm1, xmm2
++        site, = self.scan(bytes.fromhex('c5f057c2'))
++        self.assertEqual((site.kind, site.width, site.mode, site.dst, site.src1, site.src2),
++                         (isa_rewrite.KIND_AVX, 128, isa_rewrite.MODE_INT3, 0, 1, 2))
++
++    def test_avx_256_permute_is_rewritten(self):
++        # vperm2f128 ymm0,ymm1,ymm2,0
++        site, = self.scan(bytes.fromhex('c4e37506c200'))
++        self.assertEqual((site.kind, site.width, site.mode),
++                         (isa_rewrite.KIND_AVX, 255, isa_rewrite.MODE_JMP))
++
++    def test_unimplemented_avx_is_fail_closed(self):
++        # vpgatherdd ymm0,[rax+ymm1],ymm2 is an AVX2 gather not implemented here.
++        site, = self.scan(bytes.fromhex('c4e26d900408'))
++        self.assertEqual((site.kind, site.width, site.mode),
++                         (isa_rewrite.KIND_AVX, 255, isa_rewrite.MODE_UNSUPPORTED))
++
++    def test_crc32_is_rewritable(self):
++        site, = self.scan(bytes.fromhex('f20f38f1c1'))
++        self.assertEqual((site.kind, site.width, site.mode),
++                         (isa_rewrite.KIND_CRC32, 32, isa_rewrite.MODE_JMP))
++
+ 
+ if __name__ == '__main__':
+     unittest.main()
+diff --git a/tests/test_isa_rewrite_stub.c b/tests/test_isa_rewrite_stub.c
+new file mode 100644
+index 0000000..3f0b744
+--- /dev/null
++++ b/tests/test_isa_rewrite_stub.c
+@@ -0,0 +1,21 @@
++/* Checks that the larger GPR+XMM save/restore stub fits its allocation and rewrites a site. */
++#include <assert.h>
++#include <stdio.h>
++#include <string.h>
++#include "../src/isa_rewrite.h"
++
++int main(void) {
++    unsigned char arena[4096]; memset(arena, 0, sizeof arena);
++    unsigned char *image = arena, *stubs = arena + 512;
++    IsaSite s; memset(&s, 0, sizeof s);
++    s.length = 5; s.kind = ISA_AVX; s.width = 128; s.mode = ISA_MODE_JMP;
++    s.dst = 0; s.src1 = 1; s.src2 = 2; s.base = ISA_NO_REG; s.index = ISA_NO_REG;
++    memset(s.original, 0x90, s.length); memcpy(image, s.original, s.length);
++    uint64_t hit = 0;
++    IsaTable t; memset(&t, 0, sizeof t);
++    t.sites = &s; t.hits = &hit; t.count = 1; t.image_size = 128;
++    IsaReport r = isa_rewrite_apply(&t, image, stubs, CPU_SET_AVX);
++    assert(r.rewritten == 1 && r.skipped == 0 && r.jmp == 1 && image[0] == 0xe9);
++    puts("ISA rewrite stub tests: PASS");
++    return 0;
++}
