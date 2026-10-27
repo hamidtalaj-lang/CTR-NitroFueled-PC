@@ -10,26 +10,35 @@ jobs:
   build-windows:
     runs-on: windows-latest
     env:
-      # Keep the checkout path short to reduce Windows path-length pressure.
       GIT_CONFIG_COUNT: 1
       GIT_CONFIG_KEY_0: core.longpaths
       GIT_CONFIG_VALUE_0: "true"
+
     steps:
-      - name: Checkout fork containing workflow, source archive, and patch
+      - name: Checkout fork containing source archive and patch
         uses: actions/checkout@v4
         with:
           path: input
 
-      - name: Verify required files and extract exact v0.4 source snapshot
+      - name: Verify files and extract source archive
         shell: pwsh
         run: |
           $archive = "input/CTR-NitroFueled-PC-0.4.zip"
           $patch = "input/CTR_Q8400_AVX_emulation_experimental.patch"
-          if (!(Test-Path $archive)) { throw "Missing $archive. Upload the exact CTR-NitroFueled-PC-0.4.zip to the root of your fork." }
-          if (!(Test-Path $patch)) { throw "Missing $patch in the root of your fork." }
+
+          if (!(Test-Path $archive)) {
+            throw "Missing $archive. Put the source ZIP in the repository root."
+          }
+          if (!(Test-Path $patch)) {
+            throw "Missing $patch. Put the experimental patch in the repository root."
+          }
+
           Expand-Archive -LiteralPath $archive -DestinationPath source-unpacked -Force
           $root = Get-ChildItem source-unpacked -Directory | Select-Object -First 1
-          if (!$root -or !(Test-Path (Join-Path $root.FullName "build.sh"))) { throw "Could not locate extracted source root/build.sh." }
+          if (!$root -or !(Test-Path (Join-Path $root.FullName "build.sh"))) {
+            throw "Could not locate the extracted source root or build.sh."
+          }
+
           "SOURCE_DIR=$($root.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           Copy-Item $patch (Join-Path $root.FullName "CTR_Q8400_AVX_emulation_experimental.patch")
 
@@ -61,7 +70,7 @@ jobs:
             mingw-w64-clang-x86_64-spirv-headers
             mingw-w64-clang-x86_64-spirv-cross
 
-      - name: Initialize source snapshot and apply patch
+      - name: Initialize source snapshot and apply experimental patch
         shell: msys2 {0}
         run: |
           cd "$SOURCE_DIR"
@@ -69,14 +78,16 @@ jobs:
           git config user.email "actions@github.com"
           git config user.name "GitHub Actions"
           git add -A
-          git commit -m "Local v0.4 source snapshot"
+          git commit -m "Local source snapshot"
           git apply --check CTR_Q8400_AVX_emulation_experimental.patch
           git apply CTR_Q8400_AVX_emulation_experimental.patch
 
-      - name: Populate submodules with Windows Git
+      - name: Populate submodules and pin FSR-Vulkan base
         shell: pwsh
         run: |
           $root = Get-ChildItem source-unpacked -Directory | Select-Object -First 1
+          if (!$root) { throw "Extracted source directory not found." }
+
           $modules = @(
             @{ Path = "gpu/third_party/fsr-vulkan"; Url = "https://github.com/FireBurn/FSR-Vulkan.git" },
             @{ Path = "gpu/third_party/imgui"; Url = "https://github.com/ocornut/imgui.git" },
@@ -85,33 +96,37 @@ jobs:
             @{ Path = "gpu/third_party/miniz"; Url = "https://github.com/richgel999/miniz.git" },
             @{ Path = "gpu/third_party/xbyak"; Url = "https://github.com/herumi/xbyak.git" }
           )
-          # Enable long paths for Windows Git BEFORE cloning nested third-party repos.
+
           git config --global core.longpaths true
-          git config --system core.longpaths true
           foreach ($module in $modules) {
             $dest = Join-Path $root.FullName $module.Path
-            if (!(Test-Path (Join-Path $dest ".git"))) {
-              if (Test-Path $dest) { Remove-Item $dest -Recurse -Force }
-              New-Item -ItemType Directory -Force -Path (Split-Path $dest) | Out-Null
-              git -c core.longpaths=true clone --depth 1 $module.Url $dest
-                                  git -c core.longpaths=true clone --depth 1 $module.Url $dest
-                    if ($LASTEXITCODE -ne 0) { throw "Failed to clone submodule $($module.Path)" }
+            if (Test-Path $dest) {
+              Remove-Item $dest -Recurse -Force
+            }
+            New-Item -ItemType Directory -Force -Path (Split-Path $dest) | Out-Null
 
-                    if ($module.Path -eq "gpu/third_party/fsr-vulkan") {
-                        git -C $dest fetch origin c64f093
-                        if ($LASTEXITCODE -ne 0) { throw "Failed to fetch FSR-Vulkan commit c64f093" }
+            git -c core.longpaths=true clone --depth 1 $module.Url $dest
+            if ($LASTEXITCODE -ne 0) {
+              throw "Failed to clone submodule $($module.Path)"
+            }
 
-                        git -C $dest checkout --detach FETCH_HEAD
-                        if ($LASTEXITCODE -ne 0) { throw "Failed to checkout FSR-Vulkan commit c64f093" }
-                    }
-                }
-
-
+            if ($module.Path -eq "gpu/third_party/fsr-vulkan") {
+              git -C $dest fetch --depth 1 origin c64f093
+              if ($LASTEXITCODE -ne 0) {
+                throw "Failed to fetch FSR-Vulkan commit c64f093"
+              }
+              git -C $dest checkout --detach FETCH_HEAD
+              if ($LASTEXITCODE -ne 0) {
+                throw "Failed to checkout FSR-Vulkan commit c64f093"
+              }
+            }
+          }
 
       - name: Build Windows binaries
         shell: msys2 {0}
         run: |
           cd "$SOURCE_DIR"
+          set -o pipefail
           bash build.sh 2>&1 | tee out-build.log
 
       - name: Upload build outputs and logs
