@@ -1,4 +1,4 @@
-name: Build CTR Q8400 experimental (Windows, compatible FSR patches)
+name: Build CTR Q8400 experimental (Windows, individually tested FSR patches)
 
 on:
   workflow_dispatch:
@@ -124,17 +124,32 @@ jobs:
             }
           }
 
-      - name: Skip optional FSR4 profiling patch that does not match pinned upstream
+      - name: Test and apply FSR patches one by one
         shell: pwsh
         run: |
           $root = Get-ChildItem source-unpacked -Directory | Select-Object -First 1
-          $optionalPatch = Join-Path $root.FullName "gpu/patches/fsr-vulkan/0001-FSR-4-v07-provider-BB_FSR4_PROFILE-pass-timings-BB_F.patch"
-          if (Test-Path $optionalPatch) {
-            Remove-Item $optionalPatch -Force
-            Write-Host "Removed optional FSR4 profiling/statistics patch only; core FSR compatibility patches remain enabled."
-          } else {
-            Write-Host "Optional profiling patch not found; continuing."
+          $fsr = Join-Path $root.FullName "gpu/third_party/fsr-vulkan"
+          $patchDir = Join-Path $root.FullName "gpu/patches/fsr-vulkan"
+          if (!(Test-Path $fsr)) { throw "FSR-Vulkan checkout is missing." }
+          if (!(Test-Path $patchDir)) { throw "FSR patch directory is missing." }
+
+          # Apply patches sequentially against the exact pinned checkout. If a patch
+          # does not apply, remove that patch so build.sh cannot fail on it later.
+          Get-ChildItem -LiteralPath $patchDir -Filter "*.patch" | Sort-Object Name | ForEach-Object {
+            $patch = $_.FullName
+            Write-Host "===== Testing $($_.Name) ====="
+            git -C $fsr apply --check $patch 2>&1
+            if ($LASTEXITCODE -eq 0) {
+              git -C $fsr apply $patch
+              if ($LASTEXITCODE -ne 0) { throw "Patch passed check but failed to apply: $($_.Name)" }
+              Write-Host "APPLIED: $($_.Name)"
+            } else {
+              Write-Warning "SKIPPED incompatible patch: $($_.Name)"
+              Remove-Item -LiteralPath $patch -Force
+            }
           }
+          Write-Host "===== Remaining patches (already applied) ====="
+          Get-ChildItem -LiteralPath $patchDir -Filter "*.patch" | Select-Object -ExpandProperty Name
 
       - name: Build Windows binaries
         shell: msys2 {0}
@@ -159,7 +174,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: CTR-Q8400-experimental-fsr-compatible-patches
+          name: CTR-Q8400-experimental-individually-tested-fsr-patches
           path: |
             source-unpacked/**/out/*.exe
             source-unpacked/**/out/VERSION
