@@ -124,6 +124,20 @@ jobs:
             }
           }
 
+      - name: Skip incompatible FSR timing patch
+        shell: pwsh
+        run: |
+          $root = Get-ChildItem source-unpacked -Directory | Select-Object -First 1
+          if (!$root) { throw "Extracted source directory not found." }
+
+          $patch = Join-Path $root.FullName "gpu/patches/fsr-vulkan/0001-FSR-4-v07-provider-BB_FSR4_PROFILE-pass-timings-BB_F.patch"
+          if (Test-Path $patch) {
+            Rename-Item -LiteralPath $patch -NewName "0001-FSR-4-v07-provider-BB_FSR4_PROFILE-pass-timings-BB_F.patch.disabled"
+            Write-Host "Disabled only the incompatible FSR timing patch; other FSR patches remain enabled."
+          } else {
+            Write-Host "First FSR patch is already absent; continuing."
+          }
+
       - name: Build Windows binaries
         shell: msys2 {0}
         run: |
