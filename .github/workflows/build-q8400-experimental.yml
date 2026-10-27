@@ -9,6 +9,11 @@ permissions:
 jobs:
   build-windows:
     runs-on: windows-latest
+    env:
+      # Keep the checkout path short to reduce Windows path-length pressure.
+      GIT_CONFIG_COUNT: 1
+      GIT_CONFIG_KEY_0: core.longpaths
+      GIT_CONFIG_VALUE_0: "true"
     steps:
       - name: Checkout fork containing workflow, source archive, and patch
         uses: actions/checkout@v4
@@ -80,12 +85,15 @@ jobs:
             @{ Path = "gpu/third_party/miniz"; Url = "https://github.com/richgel999/miniz.git" },
             @{ Path = "gpu/third_party/xbyak"; Url = "https://github.com/herumi/xbyak.git" }
           )
+          # Enable long paths for Windows Git BEFORE cloning nested third-party repos.
+          git config --global core.longpaths true
+          git config --system core.longpaths true
           foreach ($module in $modules) {
             $dest = Join-Path $root.FullName $module.Path
             if (!(Test-Path (Join-Path $dest ".git"))) {
               if (Test-Path $dest) { Remove-Item $dest -Recurse -Force }
               New-Item -ItemType Directory -Force -Path (Split-Path $dest) | Out-Null
-              git clone --depth 1 $module.Url $dest
+              git -c core.longpaths=true clone --depth 1 $module.Url $dest
               if ($LASTEXITCODE -ne 0) { throw "Failed to clone submodule $($module.Path)" }
             }
           }
