@@ -117,7 +117,16 @@ jobs:
         env:
           BB_LTO: "OFF"
         run: |
+          # Ensure CLANG64 tools are visible to the MSYS2 shell.
+          export PATH="/clang64/bin:$PATH"
+          echo "PATH=$PATH"
+          echo "Checking required tools..."
+          command -v cmake || { echo "ERROR: cmake not found"; exit 127; }
+          command -v ninja || { echo "ERROR: ninja not found in PATH"; ls -la /clang64/bin/ninja* 2>/dev/null || true; exit 127; }
+          cmake --version
+          ninja --version
           cd "$SOURCE_DIR"
+          set -o pipefail
           bash build.sh 2>&1 | tee out-build.log
 
       - name: Upload build outputs and logs
