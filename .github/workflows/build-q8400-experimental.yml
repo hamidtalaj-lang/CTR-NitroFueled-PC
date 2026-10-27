@@ -1,4 +1,4 @@
-name: Build CTR Q8400 experimental (Windows, FSR patches restored)
+name: Build CTR Q8400 experimental (Windows, compatible FSR patches)
 
 on:
   workflow_dispatch:
@@ -124,6 +124,18 @@ jobs:
             }
           }
 
+      - name: Skip optional FSR4 profiling patch that does not match pinned upstream
+        shell: pwsh
+        run: |
+          $root = Get-ChildItem source-unpacked -Directory | Select-Object -First 1
+          $optionalPatch = Join-Path $root.FullName "gpu/patches/fsr-vulkan/0001-FSR-4-v07-provider-BB_FSR4_PROFILE-pass-timings-BB_F.patch"
+          if (Test-Path $optionalPatch) {
+            Remove-Item $optionalPatch -Force
+            Write-Host "Removed optional FSR4 profiling/statistics patch only; core FSR compatibility patches remain enabled."
+          } else {
+            Write-Host "Optional profiling patch not found; continuing."
+          }
+
       - name: Build Windows binaries
         shell: msys2 {0}
         run: |
@@ -147,7 +159,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: CTR-Q8400-experimental-fsr-patches-restored
+          name: CTR-Q8400-experimental-fsr-compatible-patches
           path: |
             source-unpacked/**/out/*.exe
             source-unpacked/**/out/VERSION
