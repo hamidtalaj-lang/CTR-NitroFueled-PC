@@ -68,6 +68,28 @@ jobs:
           git apply --check CTR_Q8400_AVX_emulation_experimental.patch
           git apply CTR_Q8400_AVX_emulation_experimental.patch
 
+      - name: Populate submodules with Windows Git
+        shell: pwsh
+        run: |
+          $root = Get-ChildItem source-unpacked -Directory | Select-Object -First 1
+          $modules = @(
+            @{ Path = "gpu/third_party/fsr-vulkan"; Url = "https://github.com/FireBurn/FSR-Vulkan.git" },
+            @{ Path = "gpu/third_party/imgui"; Url = "https://github.com/ocornut/imgui.git" },
+            @{ Path = "third_party/LibAtrac9"; Url = "https://github.com/Thealexbarney/LibAtrac9.git" },
+            @{ Path = "gpu/third_party/magic_enum"; Url = "https://github.com/Neargye/magic_enum.git" },
+            @{ Path = "gpu/third_party/miniz"; Url = "https://github.com/richgel999/miniz.git" },
+            @{ Path = "gpu/third_party/xbyak"; Url = "https://github.com/herumi/xbyak.git" }
+          )
+          foreach ($module in $modules) {
+            $dest = Join-Path $root.FullName $module.Path
+            if (!(Test-Path (Join-Path $dest ".git"))) {
+              if (Test-Path $dest) { Remove-Item $dest -Recurse -Force }
+              New-Item -ItemType Directory -Force -Path (Split-Path $dest) | Out-Null
+              git clone --depth 1 $module.Url $dest
+              if ($LASTEXITCODE -ne 0) { throw "Failed to clone submodule $($module.Path)" }
+            }
+          }
+
       - name: Build Windows binaries
         shell: msys2 {0}
         run: |
