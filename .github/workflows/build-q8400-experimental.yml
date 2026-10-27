@@ -94,6 +94,13 @@ jobs:
               if (Test-Path $dest) { Remove-Item $dest -Recurse -Force }
               New-Item -ItemType Directory -Force -Path (Split-Path $dest) | Out-Null
               git -c core.longpaths=true clone --depth 1 $module.Url $dest
+              if ($module.Path -eq "gpu/third_party/fsr-vulkan") {
+  git -C $dest fetch origin c64f093
+  if ($LASTEXITCODE -ne 0) { throw "Failed to fetch FSR-Vulkan commit c64f093" }
+
+  git -C $dest checkout --detach FETCH_HEAD
+  if ($LASTEXITCODE -ne 0) { throw "Failed to checkout FSR-Vulkan commit c64f093" }
+}
               if ($LASTEXITCODE -ne 0) { throw "Failed to clone submodule $($module.Path)" }
             }
           }
