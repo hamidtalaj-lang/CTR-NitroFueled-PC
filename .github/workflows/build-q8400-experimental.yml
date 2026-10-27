@@ -1,4 +1,4 @@
-name: Build CTR Q8400 experimental (Windows)
+name: Build CTR Q8400 experimental (FSR patches disabled)
 
 on:
   workflow_dispatch:
@@ -13,32 +13,22 @@ jobs:
       GIT_CONFIG_COUNT: 1
       GIT_CONFIG_KEY_0: core.longpaths
       GIT_CONFIG_VALUE_0: "true"
-
     steps:
-      - name: Checkout fork containing source archive and patch
+      - name: Checkout fork
         uses: actions/checkout@v4
         with:
           path: input
 
-      - name: Verify files and extract source archive
+      - name: Extract source archive
         shell: pwsh
         run: |
           $archive = "input/CTR-NitroFueled-PC-0.4.zip"
           $patch = "input/CTR_Q8400_AVX_emulation_experimental.patch"
-
-          if (!(Test-Path $archive)) {
-            throw "Missing $archive. Put the source ZIP in the repository root."
-          }
-          if (!(Test-Path $patch)) {
-            throw "Missing $patch. Put the experimental patch in the repository root."
-          }
-
+          if (!(Test-Path $archive)) { throw "Missing CTR-NitroFueled-PC-0.4.zip in repository root." }
+          if (!(Test-Path $patch)) { throw "Missing CTR_Q8400_AVX_emulation_experimental.patch in repository root." }
           Expand-Archive -LiteralPath $archive -DestinationPath source-unpacked -Force
           $root = Get-ChildItem source-unpacked -Directory | Select-Object -First 1
-          if (!$root -or !(Test-Path (Join-Path $root.FullName "build.sh"))) {
-            throw "Could not locate the extracted source root or build.sh."
-          }
-
+          if (!$root -or !(Test-Path (Join-Path $root.FullName "build.sh"))) { throw "Could not find source root/build.sh." }
           "SOURCE_DIR=$($root.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           Copy-Item $patch (Join-Path $root.FullName "CTR_Q8400_AVX_emulation_experimental.patch")
 
@@ -70,7 +60,7 @@ jobs:
             mingw-w64-clang-x86_64-spirv-headers
             mingw-w64-clang-x86_64-spirv-cross
 
-      - name: Initialize source snapshot and apply experimental patch
+      - name: Apply experimental ISA patch
         shell: msys2 {0}
         run: |
           cd "$SOURCE_DIR"
@@ -82,12 +72,10 @@ jobs:
           git apply --check CTR_Q8400_AVX_emulation_experimental.patch
           git apply CTR_Q8400_AVX_emulation_experimental.patch
 
-      - name: Populate submodules and pin FSR-Vulkan base
+      - name: Populate dependencies and pin FSR base
         shell: pwsh
         run: |
           $root = Get-ChildItem source-unpacked -Directory | Select-Object -First 1
-          if (!$root) { throw "Extracted source directory not found." }
-
           $modules = @(
             @{ Path = "gpu/third_party/fsr-vulkan"; Url = "https://github.com/FireBurn/FSR-Vulkan.git" },
             @{ Path = "gpu/third_party/imgui"; Url = "https://github.com/ocornut/imgui.git" },
@@ -96,64 +84,53 @@ jobs:
             @{ Path = "gpu/third_party/miniz"; Url = "https://github.com/richgel999/miniz.git" },
             @{ Path = "gpu/third_party/xbyak"; Url = "https://github.com/herumi/xbyak.git" }
           )
-
           git config --global core.longpaths true
           foreach ($module in $modules) {
             $dest = Join-Path $root.FullName $module.Path
-            if (Test-Path $dest) {
-              Remove-Item $dest -Recurse -Force
-            }
+            if (Test-Path $dest) { Remove-Item $dest -Recurse -Force }
             New-Item -ItemType Directory -Force -Path (Split-Path $dest) | Out-Null
-
+            git -c core.longpaths=true clone --depth 1 $module.Url $dest
+            if ($LASTEXITCODE -ne 0) { throw "Failed to clone $($module.Path)" }
             if ($module.Path -eq "gpu/third_party/fsr-vulkan") {
-              # Full history is needed because the required commit is older than HEAD.
-              git -c core.longpaths=true clone $module.Url $dest
-              if ($LASTEXITCODE -ne 0) {
-                throw "Failed to clone full FSR-Vulkan history."
-              }
-
-              git -C $dest checkout --detach c64f093
-              if ($LASTEXITCODE -ne 0) {
-                throw "Commit c64f093 is not available in the FSR-Vulkan repository history."
-              }
-            } else {
-              git -c core.longpaths=true clone --depth 1 $module.Url $dest
-              if ($LASTEXITCODE -ne 0) {
-                throw "Failed to clone submodule $($module.Path)"
-              }
+              git -C $dest fetch --depth 1 origin c64f093
+              if ($LASTEXITCODE -ne 0) { throw "Failed to fetch FSR base c64f093" }
+              git -C $dest checkout --detach FETCH_HEAD
+              if ($LASTEXITCODE -ne 0) { throw "Failed to checkout FSR base c64f093" }
             }
           }
 
-      - name: Skip all local FSR-Vulkan patches for this test build
+      - name: Disable local FSR patch application (leave FSR code in build)
         shell: pwsh
         run: |
-          $root = Get-ChildItem source-unpacked -Directory | Select-Object -First 1
-          if (!$root) { throw "Extracted source directory not found." }
-
-          $buildScript = Join-Path $root.FullName "build.sh"
-          $content = Get-Content -LiteralPath $buildScript -Raw
-          $pattern = '(?ms)^    for patch in gpu/patches/fsr-vulkan/\*\.patch; do\r?\n.*?^    done\r?\n'
-          $updated = [regex]::Replace($content, $pattern, '    # FSR-Vulkan local patches intentionally skipped for CPU compatibility test.\n', 1)
-
-          if ($updated -eq $content) {
-            throw "Could not find the Windows FSR patch loop in build.sh; refusing to continue."
-          }
-
-          Set-Content -LiteralPath $buildScript -Value $updated -Encoding utf8
-          Write-Host "Disabled application of all local FSR-Vulkan patches. FSR itself is not removed."
+          $file = Join-Path $env:SOURCE_DIR "build.sh"
+          $content = Get-Content -LiteralPath $file -Raw
+          $pattern = '(?s)    for patch in gpu/patches/fsr-vulkan/\*\.patch; do\r?\n.*?\r?\n    done'
+          if ($content -notmatch $pattern) { throw "Could not safely locate the FSR patch loop in build.sh; refusing to edit unrelated build commands." }
+          $replacement = '    # FSR patch application disabled for this compatibility build; FSR library remains enabled.'
+          $content = [regex]::Replace($content, $pattern, [System.Text.RegularExpressions.MatchEvaluator]{ param($m) $replacement }, 1)
+          Set-Content -LiteralPath $file -Value $content -NoNewline
+          # Verify the CMake continuation is still intact and print the relevant section.
+          $lines = Get-Content -LiteralPath $file
+          $cmakeIndex = -1
+          for ($i=0; $i -lt $lines.Count; $i++) { if ($lines[$i] -match 'cmake -S gpu -B out/gpu') { $cmakeIndex = $i; break } }
+          if ($cmakeIndex -lt 0 -or $lines[$cmakeIndex] -notmatch '\\$') { throw "CMake continuation line was not preserved." }
+          $start = [Math]::Max(0, $cmakeIndex - 3)
+          $end = [Math]::Min($lines.Count - 1, $cmakeIndex + 3)
+          $lines[$start..$end] | ForEach-Object { Write-Host $_ }
 
       - name: Build Windows binaries
         shell: msys2 {0}
+        env:
+          BB_LTO: "OFF"
         run: |
           cd "$SOURCE_DIR"
-          set -o pipefail
           bash build.sh 2>&1 | tee out-build.log
 
       - name: Upload build outputs and logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: CTR-Q8400-experimental-windows
+          name: CTR-Q8400-experimental-fsr-disabled
           path: |
             source-unpacked/**/out/*.exe
             source-unpacked/**/out/VERSION
