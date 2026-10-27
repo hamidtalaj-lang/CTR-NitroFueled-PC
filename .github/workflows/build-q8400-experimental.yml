@@ -126,8 +126,15 @@ jobs:
           cmake --version
           ninja --version
           cd "$SOURCE_DIR"
-          set -o pipefail
+          set +e
           bash build.sh 2>&1 | tee out-build.log
+          build_status=${PIPESTATUS[0]}
+          if [ -f out/gpu-build.log ]; then
+            echo "===== FULL out/gpu-build.log (including hidden command errors) ====="
+            cat out/gpu-build.log
+            echo "===== END out/gpu-build.log ====="
+          fi
+          exit "$build_status"
 
       - name: Upload build outputs and logs
         if: always()
