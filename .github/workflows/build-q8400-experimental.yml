@@ -148,7 +148,14 @@ jobs:
               Remove-Item -LiteralPath $patch -Force
             }
           }
-          Write-Host "===== Remaining patches (already applied) ====="
+          # The test above applies compatible patches to validate them. Undo those
+          # temporary changes before build.sh runs, because build.sh owns the real
+          # patch-application step and must apply each patch exactly once.
+          git -C $fsr reset --hard c64f093
+          if ($LASTEXITCODE -ne 0) { throw "Could not reset FSR-Vulkan after patch validation." }
+          git -C $fsr clean -fd
+          if ($LASTEXITCODE -ne 0) { throw "Could not clean FSR-Vulkan after patch validation." }
+          Write-Host "===== Compatible patch files retained for build.sh ====="
           Get-ChildItem -LiteralPath $patchDir -Filter "*.patch" | Select-Object -ExpandProperty Name
 
       - name: Build Windows binaries
