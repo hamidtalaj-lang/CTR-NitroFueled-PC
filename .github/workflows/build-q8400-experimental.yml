@@ -10,10 +10,21 @@ jobs:
   build-windows:
     runs-on: windows-latest
     steps:
-      - name: Checkout repository and submodules
+      - name: Checkout this fork (workflow and patch)
         uses: actions/checkout@v4
         with:
-          submodules: recursive
+          path: patch-repo
+          submodules: false
+
+      - name: Checkout clean upstream v0.4 source
+        shell: pwsh
+        run: |
+          git clone --branch v0.4 --depth 1 --recurse-submodules https://github.com/GetLostIn/CTR-NitroFueled-PC.git source
+          if ($LASTEXITCODE -ne 0) { throw 'Could not clone upstream v0.4 source and submodules.' }
+          if (!(Test-Path 'patch-repo/CTR_Q8400_AVX_emulation_experimental.patch')) {
+            throw 'Missing CTR_Q8400_AVX_emulation_experimental.patch in the root of your fork.'
+          }
+          Copy-Item 'patch-repo/CTR_Q8400_AVX_emulation_experimental.patch' 'source/CTR_Q8400_AVX_emulation_experimental.patch'
 
       - name: Set up MSYS2 CLANG64
         uses: msys2/setup-msys2@v2
@@ -43,20 +54,18 @@ jobs:
             mingw-w64-clang-x86_64-spirv-headers
             mingw-w64-clang-x86_64-spirv-cross
 
-      - name: Apply experimental Q8400 patch
+      - name: Apply experimental Q8400 patch to v0.4
         shell: msys2 {0}
         run: |
-          if [ ! -f CTR_Q8400_AVX_emulation_experimental.patch ]; then
-            echo "Missing CTR_Q8400_AVX_emulation_experimental.patch at repository root." >&2
-            echo "Upload the patch file to the root of your fork, then rerun this workflow." >&2
-            exit 1
-          fi
+          cd source
           git apply --check CTR_Q8400_AVX_emulation_experimental.patch
           git apply CTR_Q8400_AVX_emulation_experimental.patch
 
       - name: Build Windows binaries
         shell: msys2 {0}
-        run: bash build.sh
+        run: |
+          cd source
+          bash build.sh
 
       - name: Upload build outputs and logs
         if: always()
@@ -64,8 +73,8 @@ jobs:
         with:
           name: CTR-Q8400-experimental-windows
           path: |
-            out/*.exe
-            out/VERSION
-            out/gpu-build.log
+            source/out/*.exe
+            source/out/VERSION
+            source/out/gpu-build.log
           if-no-files-found: warn
           retention-days: 7
