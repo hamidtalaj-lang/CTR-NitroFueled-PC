@@ -80,12 +80,18 @@ jobs:
         shell: msys2 {0}
         run: |
           cd "$SOURCE_DIR"
+          git config --global user.email "actions@github.com"
+          git config --global user.name "GitHub Actions"
+          # build.sh applies gpu/patches/fsr-vulkan/*.patch with `git -C gpu/third_party/fsr-vulkan apply`.
+          # From a plain subfolder of another repo that call silently does nothing, so FSR-Vulkan
+          # must be its own git repository (as a real submodule is).
+          git -C gpu/third_party/fsr-vulkan init -q
+          git -C gpu/third_party/fsr-vulkan add -A
+          git -C gpu/third_party/fsr-vulkan commit -q -m "FSR-Vulkan pinned base"
+          echo "fsr4 blob: $(git -C gpu/third_party/fsr-vulkan hash-object src/ffx_vk_fsr4_v07.c) (patch expects c30f7cf)"
           git init -q
-          git config user.email "actions@github.com"
-          git config user.name "GitHub Actions"
           git add -A
           git commit -q -m "v0.4 source snapshot"
-          echo "fsr4 blob: $(git hash-object gpu/third_party/fsr-vulkan/src/ffx_vk_fsr4_v07.c) (patch expects c30f7cf)"
           git apply --check avx-emulation.patch
           git apply avx-emulation.patch
 
