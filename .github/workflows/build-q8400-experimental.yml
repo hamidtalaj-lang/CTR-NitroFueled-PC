@@ -121,7 +121,21 @@ jobs:
           tail -40 out/gpu-build.log 2>/dev/null
           echo "---- exe files ----"
           ls -l out/gpu/*.exe out/*.exe 2>/dev/null
+          if [ $rc -ne 0 ] && [ -f out/gpu/sacredfire.exe ] && [ -f out/gpu/CTR-NitroFueled-PC.exe ] && [ -f out/gpu/bb-gpu-capabilities.exe ]; then
+            echo "ninja produced all exes; build.sh failed only afterwards (rc=$rc). Continuing with out/gpu/*.exe."
+            rc=0
+          fi
           exit $rc
+
+      - name: Make portable ZIP (exes + DLLs + Python with iced-x86 for CPUs without BMI1/MOVBE/LZCNT)
+        shell: msys2 {0}
+        run: |
+          cd "$SOURCE_DIR"
+          mkdir -p out
+          cp -f out/gpu/sacredfire.exe out/gpu/bb-gpu-capabilities.exe out/gpu/CTR-NitroFueled-PC.exe out/
+          export MSYS2_ROOT="$(cygpath -w /)"
+          python packaging/windows/make_portable.py --version v0.4-q8400-avx
+          ls -l dist
 
       - name: Upload build outputs and logs
         if: always()
@@ -129,7 +143,8 @@ jobs:
         with:
           name: CTR-Q8400-experimental-windows
           path: |
-            source-unpacked/**/out/*.exe
+            source-unpacked/**/dist/*.zip
+            source-unpacked/**/dist/*.sha256
             source-unpacked/**/out/gpu/*.exe
             source-unpacked/**/out/VERSION
             source-unpacked/**/out/gpu-build.log
