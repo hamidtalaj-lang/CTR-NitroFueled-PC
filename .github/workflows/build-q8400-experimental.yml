@@ -111,7 +111,17 @@ jobs:
         shell: msys2 {0}
         run: |
           cd "$SOURCE_DIR"
-          bash build.sh 2>&1 | tee out-build.log
+          set +e
+          bash -x build.sh > out-build.log 2>&1
+          rc=$?
+          echo "build.sh exit code: $rc"
+          echo "---- last 60 lines of out-build.log ----"
+          tail -60 out-build.log
+          echo "---- last 40 lines of out/gpu-build.log ----"
+          tail -40 out/gpu-build.log 2>/dev/null
+          echo "---- exe files ----"
+          ls -l out/gpu/*.exe out/*.exe 2>/dev/null
+          exit $rc
 
       - name: Upload build outputs and logs
         if: always()
@@ -120,6 +130,7 @@ jobs:
           name: CTR-Q8400-experimental-windows
           path: |
             source-unpacked/**/out/*.exe
+            source-unpacked/**/out/gpu/*.exe
             source-unpacked/**/out/VERSION
             source-unpacked/**/out/gpu-build.log
             source-unpacked/**/out-build.log
