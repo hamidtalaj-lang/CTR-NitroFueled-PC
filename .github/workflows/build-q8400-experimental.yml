@@ -2,6 +2,11 @@ name: Build CTR Q8400 experimental (Windows)
 
 on:
   workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: "Upstream tag/branch/commit of GetLostIn/CTR-NitroFueled-PC to build (v0.4)"
+        default: "v0.4"
+        required: true
 
 permissions:
   contents: read
@@ -10,10 +15,24 @@ jobs:
   build-windows:
     runs-on: windows-latest
     steps:
-      - name: Checkout repository and submodules
+      - name: Checkout fork (workflow and avx-emulation.patch)
         uses: actions/checkout@v4
         with:
+          path: input
+
+      - name: Checkout upstream source with pinned submodules
+        uses: actions/checkout@v4
+        with:
+          repository: GetLostIn/CTR-NitroFueled-PC
+          ref: ${{ inputs.upstream_ref }}
           submodules: recursive
+          path: source
+
+      - name: Verify patch file
+        shell: pwsh
+        run: |
+          if (!(Test-Path input/avx-emulation.patch)) { throw "Missing avx-emulation.patch in the root of your fork." }
+          Copy-Item input/avx-emulation.patch source/avx-emulation.patch
 
       - name: Set up MSYS2 CLANG64
         uses: msys2/setup-msys2@v2
@@ -43,33 +62,19 @@ jobs:
             mingw-w64-clang-x86_64-spirv-headers
             mingw-w64-clang-x86_64-spirv-cross
 
-      - name: Apply experimental Q8400 patch
+      - name: Apply AVX emulation patch
         shell: msys2 {0}
         run: |
-          if [ ! -f CTR_Q8400_AVX_emulation_experimental.patch ]; then
-            echo "Missing CTR_Q8400_AVX_emulation_experimental.patch at repository root." >&2
-            echo "Upload the patch file to the root of your fork, then rerun this workflow." >&2
-            exit 1
-          fi
-          git apply --check CTR_Q8400_AVX_emulation_experimental.patch
-          git apply CTR_Q8400_AVX_emulation_experimental.patch
-
-      - name: Pin FSR-Vulkan to the commit the port's patches expect
-        shell: msys2 {0}
-        run: |
-          set -e
-          cd gpu/third_party/fsr-vulkan
-          git fetch --tags origin
-          git checkout -f c64f093
-          git reset --hard c64f093
-          git clean -fdx
-          blob=$(git rev-parse HEAD:src/ffx_vk_fsr4_v07.c)
-          echo "HEAD=$(git rev-parse HEAD) ffx_vk_fsr4_v07.c=$blob"
-          case "$blob" in c30f7cf*) ;; *) echo "Wrong FSR-Vulkan base: expected blob c30f7cf" >&2; exit 1;; esac
+          cd source
+          git submodule status
+          git apply --check avx-emulation.patch
+          git apply avx-emulation.patch
 
       - name: Build Windows binaries
         shell: msys2 {0}
-        run: bash build.sh
+        run: |
+          cd source
+          bash build.sh 2>&1 | tee out-build.log
 
       - name: Upload build outputs and logs
         if: always()
@@ -77,8 +82,9 @@ jobs:
         with:
           name: CTR-Q8400-experimental-windows
           path: |
-            out/*.exe
-            out/VERSION
-            out/gpu-build.log
+            source/out/*.exe
+            source/out/VERSION
+            source/out/gpu-build.log
+            source/out-build.log
           if-no-files-found: warn
           retention-days: 7
