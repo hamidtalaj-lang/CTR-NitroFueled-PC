@@ -1,0 +1,1684 @@
+diff -ruN -x out a/build.sh CTR-NitroFueled-PC-0.4/build.sh
+--- a/build.sh	2026-10-19 04:51:11.000000000 +0000
++++ b/build.sh	2026-10-20 01:32:45.562549010 +0000
+@@ -98,6 +98,8 @@
+ runtime=(src/runtime*.c)
+ # isa_emulate runs inside guest code: no XMM/YMM.
+ "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -mgeneral-regs-only -c src/isa_emulate.c -o out/isa_emulate.o
++# avx_emulate runs in the fault handler (normal host code), but its thunk call pushes below rsp.
++"$CC" -std=gnu11 -O2 -g -Wall -Wextra -Werror -mno-red-zone -c src/avx_emulate.c -o out/avx_emulate.o
+ # Third-party decoders: compiled once, without this project's -Werror policy.
+ atrac9=(third_party/LibAtrac9/C/src/*.c)
+ if [[ ! -f out/libatrac9.a || -n $(find third_party/LibAtrac9/C/src -newer out/libatrac9.a -name '*.c') ]]; then
+@@ -105,7 +107,7 @@
+     for source in "${atrac9[@]}"; do "$CC" -std=c99 -O2 -g -w -c "$source" -o "out/atrac9/$(basename "${source%.c}").o"; done
+     ar rcs out/libatrac9.a out/atrac9/*.o
+ fi
+-"$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -no-pie "${includes[@]}" -I. -Isrc src/probe.c "${runtime[@]}" src/cpu_check.c src/vulkan_smoke.c out/isa_emulate.o src/isa_rewrite.c out/libatrac9.a -lm "${gpu[@]}" "${libraries[@]}" -o out/sacredfire
++"$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -no-pie "${includes[@]}" -I. -Isrc src/probe.c "${runtime[@]}" src/cpu_check.c src/vulkan_smoke.c out/isa_emulate.o out/avx_emulate.o src/isa_rewrite.c out/libatrac9.a -lm "${gpu[@]}" "${libraries[@]}" -o out/sacredfire
+ echo "Built $PWD/out/sacredfire"
+ # out/VERSION: the source revision this build came from (the nearest v* tag, else the commit;
+ # "-dirty" when tracked files differ from it). run.sh prints it, the launcher shows it and the
+diff -ruN -x out a/docs/avx-emulation.md CTR-NitroFueled-PC-0.4/docs/avx-emulation.md
+--- a/docs/avx-emulation.md	1970-01-01 00:00:00.000000000 +0000
++++ b/docs/avx-emulation.md	2026-10-20 08:04:23.215204080 +0000
+@@ -0,0 +1,39 @@
++# AVX / SSE4.2 / POPCNT emulation (CPUs older than Sandy Bridge)
++
++The game code is built for the PS4's Jaguar CPU and uses AVX (128 and 256 bit), F16C, POPCNT and
++BMI1, thousands of times each. A host without them (Core 2, e.g. Q8400) raises an illegal
++instruction at each one. `src/avx_emulate.c` emulates them from the fault handler (`probe.c`):
++the instruction is decoded, executed, and the thread resumes after it.
++
++* On by default when the CPU lacks AVX, SSE4.2 or POPCNT. `BB_AVX_EMULATE=0` restores the old STOP.
++* Handled: the VEX forms (scalar and packed, 128 bit, and every 256 bit form that exists on Jaguar,
++  including the width-changing vcvt* and vmovmskps/vptest ymm), F16C, AES, PCLMUL, BMI1
++  (andn/bextr/blsi/blsr/blsmsk), vldmxcsr/vstmxcsr, vcmp predicates 0-31, and the SSE4.2 set:
++  CRC32, PCMPGTQ, PCMPESTRI/PCMPESTRM/PCMPISTRI/PCMPISTRM (legacy and VEX), plus POPCNT and MOVBE.
++* Still not covered: LZCNT/TZCNT (they run as BSR/BSF without a fault, so they cannot be trapped;
++  scripts/isa_rewrite.py rewrites them, which needs `pip install iced-x86`) and the 256 bit integer
++  AVX2 forms (vpaddd ymm...), which Jaguar does not have and eboot.bin does not use as code.
++  Every distinct AVX/POPCNT/SSE4.2 encoding found in eboot.bin is covered. An instruction that still
++  fails prints `AVX emulation stopped: <reason>: <bytes>`.
++* How: a VEX instruction that has a legacy SSE twin is rebuilt as that instruction and run natively
++  on fixed registers, so the host CPU computes the result; the ymm upper halves live in a per-thread
++  shadow. Instructions with no twin (vinsertf128, vpermilps, vbroadcast*, vmaskmov*, vtestps, F16C...)
++  are plain C.
++* Batching: one fault emulates the whole straight run of VEX instructions that follows (up to 128).
++  In eboot.bin the 573k AVX instructions sit in 153k runs (average 3.7, 35% of them in runs of 17+),
++  so this cuts the number of faults several-fold. Verified on random runs against real AVX hardware.
++* Cost: one exception dispatch per fault (microseconds). Expect a very low frame
++  rate; the point is to get the game running. Hot sites could later be rewritten to stubs
++  (the existing ISA rewrite mechanism) reusing the same core.
++* Windows caveat: the guest uses the System V red zone (128 bytes below rsp) and the Windows
++  exception dispatcher does not preserve it. An AVX instruction inside a leaf function with live
++  red-zone data corrupts that data. Linux (SIGILL) is unaffected.
++
++## Test (needs a CPU with AVX, F16C, AES, PCLMUL, BMI1; Linux)
++
++    python3 scripts/avx_samples.py eboot.bin samples.txt
++    gcc -std=gnu11 -O1 -mno-red-zone tests/test_avx_emulate.c -o out/avx-test
++    out/avx-test samples.txt 3
++
++Every encoding runs natively and through the emulator on the same random registers and memory;
++registers, memory and flags are compared.
+diff -ruN -x out a/gpu/CMakeLists.txt CTR-NitroFueled-PC-0.4/gpu/CMakeLists.txt
+--- a/gpu/CMakeLists.txt	2026-10-19 04:51:11.000000000 +0000
++++ b/gpu/CMakeLists.txt	2026-10-20 01:43:18.617825769 +0000
+@@ -235,11 +235,13 @@
+     target_compile_options(atrac9 PRIVATE -w)
+     set_target_properties(atrac9 PROPERTIES C_STANDARD 99 INTERPROCEDURAL_OPTIMIZATION OFF)
+     add_executable(sacredfire ../src/probe.c ${BB_RUNTIME} ../src/compat_win.c ../src/cpu_check.c ../src/vulkan_smoke.c
+-        ../src/isa_rewrite.c ../src/isa_emulate.c
++        ../src/isa_rewrite.c ../src/isa_emulate.c ../src/avx_emulate.c
+         ../packaging/windows/sacredfire.rc)
+     set_target_properties(sacredfire PROPERTIES C_STANDARD 11 C_EXTENSIONS OFF)
+     # isa_emulate runs inside guest code: no XMM/YMM.
+     set_source_files_properties(../src/isa_emulate.c PROPERTIES COMPILE_OPTIONS "-mgeneral-regs-only")
++    # avx_emulate runs in the fault handler (normal host code); its thunk call pushes below rsp.
++    set_source_files_properties(../src/avx_emulate.c PROPERTIES COMPILE_OPTIONS "-mno-red-zone")
+     # Newer clang (MSYS2) warns about write-only counters kept for diagnostics.
+     target_compile_options(sacredfire PRIVATE $<$<COMPILE_LANGUAGE:C>:-Wall -Wextra -Werror
+         -Wno-unknown-warning-option -Wno-unused-but-set-global>)
+Binary files a/scripts/__pycache__/game_check.cpython-312.pyc and CTR-NitroFueled-PC-0.4/scripts/__pycache__/game_check.cpython-312.pyc differ
+Binary files a/scripts/__pycache__/prepare.cpython-312.pyc and CTR-NitroFueled-PC-0.4/scripts/__pycache__/prepare.cpython-312.pyc differ
+diff -ruN -x out a/scripts/avx_samples.py CTR-NitroFueled-PC-0.4/scripts/avx_samples.py
+--- a/scripts/avx_samples.py	1970-01-01 00:00:00.000000000 +0000
++++ b/scripts/avx_samples.py	2026-10-20 01:33:45.964133183 +0000
+@@ -0,0 +1,41 @@
++#!/usr/bin/env python3
++"""Lists every distinct AVX (VEX) and POPCNT/CRC32/PCMPGTQ instruction encoding in eboot.bin, one hex
++string per line, for tests/test_avx_emulate.c (which runs them on a CPU that has AVX and compares
++the emulator with the real thing). Needs binutils' objdump.   usage: avx_samples.py eboot.bin out.txt"""
++import subprocess, sys
++sys.path.insert(0, __file__.rsplit('/', 1)[0] if '/' in __file__ else '.')
++from prepare import parse_self
++
++elf = parse_self(open(sys.argv[1], 'rb').read())[0]
++program_headers = elf[0x40:0x40 + 56 * int.from_bytes(elf[0x38:0x3A], 'little')]
++text = None
++for i in range(0, len(program_headers), 56):
++    ptype, flags = int.from_bytes(program_headers[i:i+4], 'little'), int.from_bytes(program_headers[i+4:i+8], 'little')
++    if ptype == 1 and flags & 1:
++        offset, size = int.from_bytes(program_headers[i+8:i+16], 'little'), int.from_bytes(program_headers[i+32:i+40], 'little')
++        text = elf[offset:offset + size]
++        break
++import os
++text = text[:int(os.environ.get('AVX_SAMPLES_LIMIT', len(text)))]
++open('/tmp/avx_text.bin', 'wb').write(text)
++dis = subprocess.Popen(['objdump', '-D', '-b', 'binary', '-m', 'i386:x86-64', '-M', 'intel', '/tmp/avx_text.bin'],
++                       stdout=subprocess.PIPE, text=True).stdout
++seen, cur = set(), None
++
++def flush():
++    if cur:
++        data, mnemonic = cur
++        if data and data[0] in ('c4', 'c5') or mnemonic in ('popcnt', 'crc32', 'pcmpgtq'):
++            seen.add(''.join(data))
++
++for line in dis:
++    parts = line.rstrip('\n').split('\t')
++    if len(parts) >= 2 and parts[0].strip().endswith(':'):
++        if len(parts) >= 3 and parts[2].strip():
++            flush()
++            cur = (parts[1].split(), parts[2].split()[0])
++        elif cur:
++            cur[0].extend(parts[1].split())
++flush()
++open(sys.argv[2], 'w').write('\n'.join(sorted(seen)) + '\n')
++print(len(seen), 'distinct encodings')
+diff -ruN -x out a/src/avx_emulate.c CTR-NitroFueled-PC-0.4/src/avx_emulate.c
+--- a/src/avx_emulate.c	1970-01-01 00:00:00.000000000 +0000
++++ b/src/avx_emulate.c	2026-10-20 08:03:20.469965266 +0000
+@@ -0,0 +1,1014 @@
++/* See avx_emulate.h. Build with -mno-red-zone (the thunk call pushes below rsp). */
++#include "avx_emulate.h"
++#include <stdio.h>
++#include <string.h>
++#ifdef _WIN32
++#include <windows.h>
++#else
++#include <sys/mman.h>
++#endif
++
++/* ------------------------------------------------------------------------------------------ */
++/* Native thunks: one legacy SSE instruction + ret, cached by its bytes.                        */
++/* ------------------------------------------------------------------------------------------ */
++typedef struct {
++    uint8_t x[4][16];            /* 0: xmm0..xmm3 */
++    uint64_t rax, rcx, rdx, rbx; /* 64..88 */
++    uint64_t flags;              /* 96 */
++    uint32_t mxcsr, pad;         /* 104 */
++} Thunk;
++
++static void call_thunk(const void *code, Thunk *t) {
++    uint32_t host;
++    __asm__ volatile(
++        "stmxcsr %[host]\n\t"
++        "ldmxcsr 104(%%rsi)\n\t"
++        "movups   0(%%rsi), %%xmm0\n\t"
++        "movups  16(%%rsi), %%xmm1\n\t"
++        "movups  32(%%rsi), %%xmm2\n\t"
++        "movups  48(%%rsi), %%xmm3\n\t"
++        "movq    72(%%rsi), %%rcx\n\t"
++        "movq    80(%%rsi), %%rdx\n\t"
++        "movq    88(%%rsi), %%rbx\n\t"
++        "movq    64(%%rsi), %%rax\n\t"
++        "call *%%rdi\n\t"
++        "movups %%xmm0,  0(%%rsi)\n\t"
++        "movups %%xmm1, 16(%%rsi)\n\t"
++        "movups %%xmm2, 32(%%rsi)\n\t"
++        "movups %%xmm3, 48(%%rsi)\n\t"
++        "movq   %%rax, 64(%%rsi)\n\t"
++        "movq   %%rcx, 72(%%rsi)\n\t"
++        "movq   %%rdx, 80(%%rsi)\n\t"
++        "movq   %%rbx, 88(%%rsi)\n\t"
++        "pushfq\n\t"
++        "popq   96(%%rsi)\n\t"
++        "stmxcsr 104(%%rsi)\n\t"
++        "ldmxcsr %[host]\n\t"
++        : [host] "=m"(host)
++        : "S"(t), "D"(code)
++        : "rax", "rcx", "rdx", "rbx", "memory", "cc", "xmm0", "xmm1", "xmm2", "xmm3");
++}
++
++enum { CACHE_SLOTS = 8192, POOL_BYTES = 1 << 18 };
++typedef struct { uint8_t key[16]; uint8_t n; volatile int ready; const void *code; } CacheEntry;
++static CacheEntry cache[CACHE_SLOTS];
++static uint8_t *pool;
++static size_t pool_used;
++static volatile int cache_lock;
++
++static uint8_t *alloc_exec(size_t n) {
++#ifdef _WIN32
++    return VirtualAlloc(NULL, n, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
++#else
++    void *p = mmap(NULL, n, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++    return p == MAP_FAILED ? NULL : p;
++#endif
++}
++
++static const void *get_thunk(const uint8_t *bytes, int n) {
++    uint8_t key[16] = {0};
++    memcpy(key, bytes, (size_t)n);
++    uint32_t h = 2166136261u;
++    for (int i = 0; i < 16; ++i) h = (h ^ key[i]) * 16777619u;
++    for (int pass = 0; pass < 2; ++pass) {
++        if (pass) while (__atomic_exchange_n(&cache_lock, 1, __ATOMIC_ACQUIRE)) {}
++        for (uint32_t i = 0; i < CACHE_SLOTS; ++i) {
++            CacheEntry *e = &cache[(h + i) % CACHE_SLOTS];
++            if (__atomic_load_n(&e->ready, __ATOMIC_ACQUIRE)) {
++                if (e->n == n && !memcmp(e->key, key, 16)) { if (pass) __atomic_store_n(&cache_lock, 0, __ATOMIC_RELEASE); return e->code; }
++                continue;
++            }
++            if (!pass) break;                    /* miss: retry under the lock */
++            if (!pool) pool = alloc_exec(POOL_BYTES);
++            if (!pool || pool_used + 16 > POOL_BYTES) { __atomic_store_n(&cache_lock, 0, __ATOMIC_RELEASE); return NULL; }
++            uint8_t *slot = pool + pool_used;
++            pool_used += 16;
++            memcpy(slot, bytes, (size_t)n);
++            memcpy(e->key, key, 16);
++            e->n = (uint8_t)n;
++            e->code = slot;
++            __atomic_store_n(&e->ready, 1, __ATOMIC_RELEASE);
++            __atomic_store_n(&cache_lock, 0, __ATOMIC_RELEASE);
++            return slot;
++        }
++    }
++    __atomic_store_n(&cache_lock, 0, __ATOMIC_RELEASE);
++    return NULL;
++}
++
++/* ------------------------------------------------------------------------------------------ */
++/* Decoder                                                                                      */
++/* ------------------------------------------------------------------------------------------ */
++typedef struct {
++    int map, pp, L, W, vvvv, opc;
++    int reg, rm;                 /* extended register numbers (rm: register form only) */
++    int ext;                     /* modrm.reg low 3 bits (opcode extension) */
++    int is_mem, has_base, has_index, ripr, base, index, scale;
++    int64_t disp;
++    int has_imm; uint8_t imm;
++    int len;
++} Dec;
++
++static int fail(char *why, size_t n, const uint8_t *p, const char *msg) {
++    if (why && n) snprintf(why, n, "%s: %02x %02x %02x %02x %02x %02x %02x %02x", msg, p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
++    return 0;
++}
++
++/* Decodes modrm/sib/disp at p[*i]; rexr/rexx/rexb are the 0/1 extension bits. */
++static void decode_modrm(const uint8_t *p, int *i, Dec *d, int rexr, int rexx, int rexb) {
++    uint8_t m = p[(*i)++];
++    int mod = m >> 6, rm = m & 7;
++    d->ext = (m >> 3) & 7;
++    d->reg = d->ext | (rexr << 3);
++    if (mod == 3) { d->is_mem = 0; d->rm = rm | (rexb << 3); return; }
++    d->is_mem = 1;
++    if (rm == 4) {
++        uint8_t sib = p[(*i)++];
++        d->scale = sib >> 6;
++        int idx = ((sib >> 3) & 7) | (rexx << 3);
++        d->has_index = idx != 4;
++        d->index = idx;
++        d->base = (sib & 7) | (rexb << 3);
++        if ((sib & 7) == 5 && mod == 0) { d->has_base = 0; int32_t v; memcpy(&v, p + *i, 4); *i += 4; d->disp = v; }
++        else d->has_base = 1;
++    } else if (rm == 5 && mod == 0) {
++        int32_t v; memcpy(&v, p + *i, 4); *i += 4;
++        d->ripr = 1; d->disp = v;
++    } else { d->has_base = 1; d->base = rm | (rexb << 3); }
++    if (mod == 1) d->disp = (int8_t)p[(*i)++];
++    else if (mod == 2) { int32_t v; memcpy(&v, p + *i, 4); *i += 4; d->disp = v; }
++}
++
++static uint64_t effective_address(const AvxState *s, const Dec *d, const uint8_t *insn) {
++    if (d->ripr) return (uint64_t)(uintptr_t)(insn + d->len) + (uint64_t)d->disp;
++    uint64_t ea = (uint64_t)d->disp;
++    if (d->has_base) ea += s->gpr[d->base];
++    if (d->has_index) ea += s->gpr[d->index] << d->scale;
++    return ea;
++}
++
++/* ------------------------------------------------------------------------------------------ */
++/* Operation table                                                                              */
++/* ------------------------------------------------------------------------------------------ */
++enum {
++    F_NDS = 1,        /* vvvv is the first source (and the destination's initial value) */
++    F_NDSREG = 2,     /* ... only when rm is a register (vmovss/vmovsd) */
++    F_STORE = 4,      /* rm is the destination, reg the source */
++    F_NODST = 8,      /* sets flags only */
++    F_RG = 16,        /* reg operand is a general register */
++    F_MG = 32,        /* rm operand is a general register (or memory) */
++    F_IMM = 64,
++    F_YMM = 128,      /* 256-bit form = the same operation on both 128-bit lanes */
++    F_W64 = 256,      /* VEX.W selects a 64-bit general register: REX.W on the twin */
++    F_SOFT = 512,     /* done in C, `id` says which */
++    F_SPLIT4 = 1024,  /* imm8 holds 4 bits per lane (blendps) */
++    F_SPLIT2 = 2048,  /* imm8 holds 2 bits per lane (blendpd, shufpd) */
++    F_SHIFTI = 4096,  /* shift by immediate group (opcodes 71-73) */
++    F_BLENDV = 8192,  /* 4-operand blends: mask register in imm8[7:4] */
++    F_ZERO = 16384    /* vzeroupper / vzeroall */
++};
++enum { MS_PPSCALAR = 0xFA, MS_W = 0xFB, MS_COMIS = 0xFC, MS_DDUP = 0xFD };
++enum { S_INSERTF128 = 1, S_EXTRACTF128, S_PERM2F128, S_BCASTSS, S_BCASTSD, S_BCASTF128, S_PERMILPS_IMM,
++       S_PERMILPD_IMM, S_PERMILPS_VAR, S_PERMILPD_VAR, S_TESTPS, S_TESTPD, S_MASKLD_PS, S_MASKLD_PD,
++       S_MASKST_PS, S_MASKST_PD, S_CVTPH2PS, S_CVTPS2PH, S_PCMPGTQ, S_AESENC, S_AESENCLAST, S_AESDEC,
++       S_AESDECLAST, S_AESIMC, S_AESKEYGEN, S_PCLMUL, S_ANDN, S_BEXTR, S_BLSX, S_LDMXCSR, S_STMXCSR, S_PCMPSTR };
++#define P0 1
++#define P66 2
++#define PF3 4
++#define PF2 8
++typedef struct { uint8_t map, opc, ppm; uint16_t fl; uint8_t ms, id; } Op;
++
++static const Op ops[] = {
++    /* map 1 (0F) */
++    {1, 0x10, P0 | P66, F_YMM, 16, 0},       {1, 0x10, PF3 | PF2, F_NDSREG, MS_PPSCALAR, 0},
++    {1, 0x11, P0 | P66, F_STORE | F_YMM, 16, 0}, {1, 0x11, PF3 | PF2, F_STORE | F_NDSREG, MS_PPSCALAR, 0},
++    {1, 0x12, P0 | P66, F_NDS, 8, 0},        {1, 0x12, PF3, F_YMM, 16, 0},      {1, 0x12, PF2, F_YMM, MS_DDUP, 0},
++    {1, 0x13, P0 | P66, F_STORE, 8, 0},
++    {1, 0x14, P0 | P66, F_NDS | F_YMM, 16, 0},   {1, 0x15, P0 | P66, F_NDS | F_YMM, 16, 0},
++    {1, 0x16, P0 | P66, F_NDS, 8, 0},        {1, 0x16, PF3, F_YMM, 16, 0},
++    {1, 0x17, P0 | P66, F_STORE, 8, 0},
++    {1, 0x28, P0 | P66, F_YMM, 16, 0},       {1, 0x29, P0 | P66, F_STORE | F_YMM, 16, 0},
++    {1, 0x2A, PF3 | PF2, F_NDS | F_MG | F_W64, MS_W, 0},
++    {1, 0x2B, P0 | P66, F_STORE | F_YMM, 16, 0},
++    {1, 0x2C, PF3 | PF2, F_RG | F_W64, MS_PPSCALAR, 0}, {1, 0x2D, PF3 | PF2, F_RG | F_W64, MS_PPSCALAR, 0},
++    {1, 0x2E, P0 | P66, F_NODST, MS_COMIS, 0},   {1, 0x2F, P0 | P66, F_NODST, MS_COMIS, 0},
++    {1, 0x50, P0 | P66, F_RG, 16, 0},
++    {1, 0x51, P0 | P66, F_YMM, 16, 0},       {1, 0x51, PF3 | PF2, F_NDS, MS_PPSCALAR, 0},
++    {1, 0x52, P0, F_YMM, 16, 0},             {1, 0x52, PF3, F_NDS, 4, 0},
++    {1, 0x53, P0, F_YMM, 16, 0},             {1, 0x53, PF3, F_NDS, 4, 0},
++    {1, 0x54, P0 | P66, F_NDS | F_YMM, 16, 0}, {1, 0x55, P0 | P66, F_NDS | F_YMM, 16, 0},
++    {1, 0x56, P0 | P66, F_NDS | F_YMM, 16, 0}, {1, 0x57, P0 | P66, F_NDS | F_YMM, 16, 0},
++    {1, 0x58, P0 | P66, F_NDS | F_YMM, 16, 0}, {1, 0x58, PF3 | PF2, F_NDS, MS_PPSCALAR, 0},
++    {1, 0x59, P0 | P66, F_NDS | F_YMM, 16, 0}, {1, 0x59, PF3 | PF2, F_NDS, MS_PPSCALAR, 0},
++    {1, 0x5A, P0, 0, 8, 0},                  {1, 0x5A, P66, 0, 16, 0},
++    {1, 0x5A, PF3, F_NDS, 4, 0},             {1, 0x5A, PF2, F_NDS, 8, 0},
++    {1, 0x5B, P0 | P66 | PF3, F_YMM, 16, 0},
++    {1, 0x5C, P0 | P66, F_NDS | F_YMM, 16, 0}, {1, 0x5C, PF3 | PF2, F_NDS, MS_PPSCALAR, 0},
++    {1, 0x5D, P0 | P66, F_NDS | F_YMM, 16, 0}, {1, 0x5D, PF3 | PF2, F_NDS, MS_PPSCALAR, 0},
++    {1, 0x5E, P0 | P66, F_NDS | F_YMM, 16, 0}, {1, 0x5E, PF3 | PF2, F_NDS, MS_PPSCALAR, 0},
++    {1, 0x5F, P0 | P66, F_NDS | F_YMM, 16, 0}, {1, 0x5F, PF3 | PF2, F_NDS, MS_PPSCALAR, 0},
++    {1, 0x6E, P66, F_MG | F_W64, MS_W, 0},
++    {1, 0x6F, P66 | PF3, F_YMM, 16, 0},
++    {1, 0x70, P66 | PF3 | PF2, F_IMM, 16, 0},
++    {1, 0x71, P66, F_SHIFTI | F_IMM, 16, 0}, {1, 0x72, P66, F_SHIFTI | F_IMM, 16, 0}, {1, 0x73, P66, F_SHIFTI | F_IMM, 16, 0},
++    {1, 0x77, P0, F_ZERO, 0, 0},
++    {1, 0x7C, P66 | PF2, F_NDS | F_YMM, 16, 0}, {1, 0x7D, P66 | PF2, F_NDS | F_YMM, 16, 0},
++    {1, 0x7E, P66, F_STORE | F_MG | F_W64, MS_W, 0}, {1, 0x7E, PF3, 0, 8, 0},
++    {1, 0x7F, P66 | PF3, F_STORE | F_YMM, 16, 0},
++    {1, 0xC2, P0 | P66, F_NDS | F_IMM | F_YMM, 16, 0}, {1, 0xC2, PF3 | PF2, F_NDS | F_IMM, MS_PPSCALAR, 0},
++    {1, 0xC4, P66, F_NDS | F_MG | F_IMM, 2, 0},
++    {1, 0xC5, P66, F_RG | F_IMM, 16, 0},
++    {1, 0xC6, P0, F_NDS | F_IMM | F_YMM, 16, 0}, {1, 0xC6, P66, F_NDS | F_IMM | F_YMM | F_SPLIT2, 16, 0},
++    {1, 0xAE, P0, F_SOFT, 4, S_LDMXCSR},
++    {1, 0xD0, P66 | PF2, F_NDS | F_YMM, 16, 0},
++    {1, 0xD6, P66, F_STORE, 8, 0},
++    {1, 0xD7, P66, F_RG, 16, 0},
++    {1, 0xE6, P66, 0, 16, 0}, {1, 0xE6, PF2, 0, 16, 0}, {1, 0xE6, PF3, 0, 8, 0},
++    {1, 0xE7, P66, F_STORE | F_YMM, 16, 0},
++    {1, 0xF0, PF2, F_YMM, 16, 0},
++    /* map 2 (0F38) */
++    {2, 0x0C, P66, F_SOFT | F_NDS, 16, S_PERMILPS_VAR}, {2, 0x0D, P66, F_SOFT | F_NDS, 16, S_PERMILPD_VAR},
++    {2, 0x0E, P66, F_SOFT, 16, S_TESTPS},     {2, 0x0F, P66, F_SOFT, 16, S_TESTPD},
++    {2, 0x13, P66, F_SOFT, 8, S_CVTPH2PS},
++    {2, 0x17, P66, F_NODST, 16, 0},
++    {2, 0x18, P66, F_SOFT, 4, S_BCASTSS},     {2, 0x19, P66, F_SOFT, 8, S_BCASTSD},   {2, 0x1A, P66, F_SOFT, 16, S_BCASTF128},
++    {2, 0x2C, P66, F_SOFT, 16, S_MASKLD_PS},  {2, 0x2D, P66, F_SOFT, 16, S_MASKLD_PD},
++    {2, 0x2E, P66, F_SOFT, 16, S_MASKST_PS},  {2, 0x2F, P66, F_SOFT, 16, S_MASKST_PD},
++    {2, 0x37, P66, F_SOFT | F_NDS, 16, S_PCMPGTQ},
++    {2, 0x41, P66, 0, 16, 0},
++    {2, 0xDB, P66, F_SOFT, 16, S_AESIMC}, {2, 0xDC, P66, F_SOFT | F_NDS, 16, S_AESENC}, {2, 0xDD, P66, F_SOFT | F_NDS, 16, S_AESENCLAST},
++    {2, 0xDE, P66, F_SOFT | F_NDS, 16, S_AESDEC}, {2, 0xDF, P66, F_SOFT | F_NDS, 16, S_AESDECLAST},
++    {2, 0xF2, P0, F_SOFT, 8, S_ANDN}, {2, 0xF3, P0, F_SOFT, 8, S_BLSX}, {2, 0xF7, P0, F_SOFT, 8, S_BEXTR},
++    /* map 3 (0F3A) */
++    {3, 0x04, P66, F_SOFT | F_IMM, 16, S_PERMILPS_IMM}, {3, 0x05, P66, F_SOFT | F_IMM, 16, S_PERMILPD_IMM},
++    {3, 0x06, P66, F_SOFT | F_IMM | F_NDS, 32, S_PERM2F128},
++    {3, 0x08, P66, F_IMM | F_YMM, 16, 0},     {3, 0x09, P66, F_IMM | F_YMM, 16, 0},
++    {3, 0x0A, P66, F_NDS | F_IMM, 4, 0},      {3, 0x0B, P66, F_NDS | F_IMM, 8, 0},
++    {3, 0x0C, P66, F_NDS | F_IMM | F_YMM | F_SPLIT4, 16, 0}, {3, 0x0D, P66, F_NDS | F_IMM | F_YMM | F_SPLIT2, 16, 0},
++    {3, 0x0E, P66, F_NDS | F_IMM, 16, 0},     {3, 0x0F, P66, F_NDS | F_IMM, 16, 0},
++    {3, 0x14, P66, F_STORE | F_MG | F_IMM, 1, 0}, {3, 0x15, P66, F_STORE | F_MG | F_IMM, 2, 0},
++    {3, 0x16, P66, F_STORE | F_MG | F_IMM | F_W64, MS_W, 0}, {3, 0x17, P66, F_STORE | F_MG | F_IMM, 4, 0},
++    {3, 0x18, P66, F_SOFT | F_IMM | F_NDS, 16, S_INSERTF128}, {3, 0x19, P66, F_SOFT | F_IMM, 16, S_EXTRACTF128},
++    {3, 0x1D, P66, F_SOFT | F_IMM, 16, S_CVTPS2PH},
++    {3, 0x20, P66, F_NDS | F_MG | F_IMM, 1, 0}, {3, 0x21, P66, F_NDS | F_IMM, 4, 0},
++    {3, 0x22, P66, F_NDS | F_MG | F_IMM | F_W64, MS_W, 0},
++    {3, 0x60, P66, F_SOFT | F_IMM, 16, S_PCMPSTR}, {3, 0x61, P66, F_SOFT | F_IMM, 16, S_PCMPSTR},
++    {3, 0x62, P66, F_SOFT | F_IMM, 16, S_PCMPSTR}, {3, 0x63, P66, F_SOFT | F_IMM, 16, S_PCMPSTR},
++    {3, 0x44, P66, F_SOFT | F_NDS | F_IMM, 16, S_PCLMUL}, {3, 0xDF, P66, F_SOFT | F_IMM, 16, S_AESKEYGEN},
++    {3, 0x40, P66, F_NDS | F_IMM | F_YMM, 16, 0}, {3, 0x41, P66, F_NDS | F_IMM, 16, 0}, {3, 0x42, P66, F_NDS | F_IMM, 16, 0},
++    {3, 0x4A, P66, F_BLENDV | F_IMM, 16, 0},  {3, 0x4B, P66, F_BLENDV | F_IMM, 16, 0}, {3, 0x4C, P66, F_BLENDV | F_IMM, 16, 0},
++};
++
++/* Opcode families too regular for the table. */
++static int find_op(const Dec *d, Op *out) {
++    for (size_t i = 0; i < sizeof ops / sizeof *ops; ++i)
++        if (ops[i].map == d->map && ops[i].opc == d->opc && (ops[i].ppm & (1 << d->pp))) { *out = ops[i]; return 1; }
++    int o = d->opc;
++    memset(out, 0, sizeof *out);
++    out->map = (uint8_t)d->map; out->opc = (uint8_t)o; out->ms = 16;
++    if (d->pp != 1) return 0;
++    if (d->map == 1) {                                  /* 66 0F integer, NDS */
++        static const uint8_t list[] = {0x60,0x61,0x62,0x63,0x64,0x65,0x66,0x67,0x68,0x69,0x6A,0x6B,0x6C,0x6D,0x74,0x75,0x76,
++            0xD1,0xD2,0xD3,0xD4,0xD5,0xD8,0xD9,0xDA,0xDB,0xDC,0xDD,0xDE,0xDF,0xE0,0xE1,0xE2,0xE3,0xE4,0xE5,
++            0xE8,0xE9,0xEA,0xEB,0xEC,0xED,0xEE,0xEF,0xF1,0xF2,0xF3,0xF4,0xF5,0xF6,0xF8,0xF9,0xFA,0xFB,0xFC,0xFD,0xFE};
++        for (size_t i = 0; i < sizeof list; ++i) if (list[i] == o) { out->fl = F_NDS; return 1; }
++    } else if (d->map == 2) {
++        if (o <= 0x0B || o == 0x28 || o == 0x29 || o == 0x2B || (o >= 0x38 && o <= 0x40)) { out->fl = F_NDS; return 1; }
++        if (o == 0x1C || o == 0x1D || o == 0x1E || o == 0x2A) { out->fl = 0; return 1; }
++        static const uint8_t sz[6] = {8, 4, 2, 8, 4, 8};   /* bw bd bq wd wq dq */
++        if ((o >= 0x20 && o <= 0x25) || (o >= 0x30 && o <= 0x35)) { out->fl = 0; out->ms = sz[o & 7]; return 1; }
++    }
++    return 0;
++}
++
++/* VEX.L=1 on an op without a per-lane 256-bit form: fine for scalar ops (L is ignored), an error otherwise. */
++static int allows_l1(const Op *o) {
++    if (o->fl & F_YMM) return 1;
++    if (o->map == 1 && (o->opc == 0xE6 || (o->opc == 0x5A && (o->ppm & (P0 | P66))))) return 0;
++    return o->ms != 16 || (o->fl & F_MG);
++}
++
++static int op_msize(const Op *o, const Dec *d) {
++    switch (o->ms) {
++    case MS_PPSCALAR: return d->pp == 2 ? 4 : 8;
++    case MS_W: return d->W ? 8 : 4;
++    case MS_COMIS: return d->pp == 1 ? 8 : 4;
++    case MS_DDUP: return d->L ? 16 : 8;
++    default: return o->ms;
++    }
++}
++
++/* ------------------------------------------------------------------------------------------ */
++/* Register / operand helpers                                                                   */
++/* ------------------------------------------------------------------------------------------ */
++static void get_vec(const AvxState *s, int r, int bytes, uint8_t *out) {
++    memcpy(out, s->xmm[r], 16);
++    if (bytes == 32) memcpy(out + 16, s->ymmh[r], 16);
++}
++static void set_vec(AvxState *s, int r, int bytes, const uint8_t *in) {
++    memcpy(s->xmm[r], in, 16);
++    if (bytes == 32) memcpy(s->ymmh[r], in + 16, 16); else memset(s->ymmh[r], 0, 16);
++}
++static void get_rm(const AvxState *s, const Dec *d, uint64_t ea, int bytes, uint8_t *out) {
++    if (d->is_mem) memcpy(out, (const void *)(uintptr_t)ea, (size_t)bytes);
++    else get_vec(s, d->rm, bytes, out);
++}
++
++/* ------------------------------------------------------------------------------------------ */
++/* Generic path: the legacy twin, executed natively                                             */
++/* ------------------------------------------------------------------------------------------ */
++static int build_legacy(uint8_t *code, const Dec *d, const Op *o, int mod, int regf, int rmf, uint8_t imm, int with_imm) {
++    static const uint8_t ppb[4] = {0, 0x66, 0xF3, 0xF2};
++    int n = 0;
++    if (d->pp) code[n++] = ppb[d->pp];
++    if ((o->fl & F_W64) && d->W) code[n++] = 0x48;
++    code[n++] = 0x0F;
++    if (d->map == 2) code[n++] = 0x38;
++    if (d->map == 3) code[n++] = 0x3A;
++    code[n++] = (uint8_t)d->opc;
++    code[n++] = (uint8_t)((mod << 6) | (regf << 3) | rmf);
++    if (with_imm) code[n++] = imm;
++    code[n++] = 0xC3;
++    return n;
++}
++
++static int exec_legacy(AvxState *s, const Dec *d, const Op *o, uint64_t ea) {
++    const int lanes = ((o->fl & F_YMM) && d->L) ? 2 : 1;
++    const int msz = op_msize(o, d);
++    for (int lane = 0; lane < lanes; ++lane) {
++        Thunk t;
++        memset(&t, 0, sizeof t);
++        t.mxcsr = s->mxcsr;
++        uint8_t temp[16] __attribute__((aligned(16))) = {0};
++        uint8_t *rp = lane ? s->ymmh[d->reg] : s->xmm[d->reg];
++        uint8_t *vp = lane ? s->ymmh[d->vvvv] : s->xmm[d->vvvv];
++        uint8_t *mp = d->is_mem ? NULL : (lane ? s->ymmh[d->rm] : s->xmm[d->rm]);
++        uint64_t lea = ea + 16u * (unsigned)lane;
++        uint8_t imm = d->imm;
++        if (o->fl & F_SPLIT4) imm = (uint8_t)((d->imm >> (4 * lane)) & 0xF);
++        if (o->fl & F_SPLIT2) imm = (uint8_t)((d->imm >> (2 * lane)) & 3);
++        int mod, rmf;
++        if (d->is_mem) { mod = 0; rmf = 3; t.rbx = (uint64_t)(uintptr_t)temp; }
++        else if (o->fl & F_MG) { mod = 3; rmf = 0; }
++        else { mod = 3; rmf = 1; }
++        const int mem_read = d->is_mem && !(o->fl & F_STORE);
++        if (o->fl & F_STORE) {
++            memcpy(t.x[0], rp, 16);
++            if (!d->is_mem && !(o->fl & F_MG)) memcpy(t.x[1], (o->fl & F_NDSREG) ? vp : mp, 16);
++            if (!d->is_mem && (o->fl & F_MG)) t.rax = s->gpr[d->rm];
++        } else {
++            if ((o->fl & F_NDS) || ((o->fl & F_NDSREG) && !d->is_mem)) memcpy(t.x[0], vp, 16);
++            else if (!(o->fl & F_RG)) memcpy(t.x[0], rp, 16);
++            if (mem_read) memcpy(temp, (const void *)(uintptr_t)lea, (size_t)(msz > 16 ? 16 : msz));
++            else if (!d->is_mem && (o->fl & F_MG)) t.rax = s->gpr[d->rm];
++            else if (!d->is_mem) memcpy(t.x[1], mp, 16);
++        }
++        uint8_t code[16];
++        int n = build_legacy(code, d, o, mod, 0, rmf, imm, (o->fl & F_IMM) != 0);
++        const void *thunk = get_thunk(code, n);
++        if (!thunk) return 0;
++        call_thunk(thunk, &t);
++        s->mxcsr = t.mxcsr;
++        if (o->fl & F_STORE) {
++            if (d->is_mem) memcpy((void *)(uintptr_t)lea, temp, (size_t)(msz > 16 ? 16 : msz));
++            else if (o->fl & F_MG) s->gpr[d->rm] = t.rax;
++            else memcpy(mp, t.x[1], 16);
++        } else if (o->fl & F_NODST) {
++            s->rflags = (s->rflags & ~0x8D5ull) | (t.flags & 0x8D5ull);
++        } else if (o->fl & F_RG) {
++            s->gpr[d->reg] = t.rax;
++        } else {
++            memcpy(rp, t.x[0], 16);
++        }
++    }
++    if (lanes == 1) {                                  /* VEX.128 and scalar ops zero bits 255:128 */
++        if ((o->fl & F_STORE) && !d->is_mem && !(o->fl & F_MG)) memset(s->ymmh[d->rm], 0, 16);
++        else if (!(o->fl & (F_STORE | F_NODST | F_RG))) memset(s->ymmh[d->reg], 0, 16);
++    }
++    return 1;
++}
++
++static int exec_shifti(AvxState *s, const Dec *d, const Op *o) {
++    if (d->is_mem || d->L) return 0;
++    Thunk t; memset(&t, 0, sizeof t);
++    t.mxcsr = s->mxcsr;
++    memcpy(t.x[1], s->xmm[d->rm], 16);
++    uint8_t code[16];
++    int n = build_legacy(code, d, o, 3, d->ext, 1, d->imm, 1);
++    const void *thunk = get_thunk(code, n);
++    if (!thunk) return 0;
++    call_thunk(thunk, &t);
++    s->mxcsr = t.mxcsr;
++    memcpy(s->xmm[d->vvvv], t.x[1], 16);
++    memset(s->ymmh[d->vvvv], 0, 16);
++    return 1;
++}
++
++static int exec_blendv(AvxState *s, const Dec *d, uint64_t ea) {
++    static const uint8_t legacy[3] = {0x14, 0x15, 0x10};   /* 4A blendvps, 4B blendvpd, 4C pblendvb */
++    if (d->opc == 0x4C && d->L) return 0;
++    int mask_reg = d->imm >> 4;
++    for (int lane = 0; lane < (d->L ? 2 : 1); ++lane) {
++        Thunk t; memset(&t, 0, sizeof t);
++        t.mxcsr = s->mxcsr;
++        uint8_t temp[16] __attribute__((aligned(16))) = {0};
++        memcpy(t.x[0], lane ? s->ymmh[mask_reg] : s->xmm[mask_reg], 16);
++        memcpy(t.x[1], lane ? s->ymmh[d->vvvv] : s->xmm[d->vvvv], 16);
++        int mod = 3, rmf = 2;
++        if (d->is_mem) { mod = 0; rmf = 3; t.rbx = (uint64_t)(uintptr_t)temp; memcpy(temp, (const void *)(uintptr_t)(ea + 16u * (unsigned)lane), 16); }
++        else memcpy(t.x[2], lane ? s->ymmh[d->rm] : s->xmm[d->rm], 16);
++        uint8_t code[8] = {0x66, 0x0F, 0x38, legacy[d->opc - 0x4A], (uint8_t)((mod << 6) | (1 << 3) | rmf), 0xC3};
++        const void *thunk = get_thunk(code, 6);
++        if (!thunk) return 0;
++        call_thunk(thunk, &t);
++        s->mxcsr = t.mxcsr;
++        memcpy(lane ? s->ymmh[d->reg] : s->xmm[d->reg], t.x[1], 16);
++    }
++    if (!d->L) memset(s->ymmh[d->reg], 0, 16);
++    return 1;
++}
++
++/* ------------------------------------------------------------------------------------------ */
++/* Portable C: instructions with no legacy twin                                                 */
++/* ------------------------------------------------------------------------------------------ */
++static float half_to_float_bits(uint16_t h, uint32_t *bits) {
++    uint32_t sign = (uint32_t)(h & 0x8000) << 16, exp = (h >> 10) & 0x1F, man = h & 0x3FF, out;
++    if (exp == 0) {
++        if (!man) out = sign;
++        else { int e = -1; do { ++e; man <<= 1; } while (!(man & 0x400)); man &= 0x3FF; out = sign | ((uint32_t)(112 - e) << 23) | (man << 13); }
++    } else if (exp == 31) out = sign | 0x7F800000u | (man << 13) | (man ? 0x400000u : 0);
++    else out = sign | ((exp + 112) << 23) | (man << 13);
++    *bits = out;
++    return 0;
++}
++
++/* rc: 0 nearest-even, 1 down, 2 up, 3 truncate. */
++static uint16_t float_to_half(uint32_t f, int rc) {
++    uint32_t sign = (f >> 16) & 0x8000, exp = (f >> 23) & 0xFF, man = f & 0x7FFFFF;
++    const int neg = sign != 0;
++    if (exp == 0xFF) return man ? (uint16_t)(sign | 0x7E00 | (man >> 13)) : (uint16_t)(sign | 0x7C00);
++    int inexact_up = (rc == 2 && !neg) || (rc == 1 && neg);       /* directed rounding away from zero */
++    if (exp == 0) {                                                /* zero or float denormal: far below half's range */
++        if (!man) return (uint16_t)sign;
++        return (uint16_t)(sign | (inexact_up ? 1 : 0));
++    }
++    int e = (int)exp - 127;
++    if (e > 15) return (uint16_t)(sign | (rc == 0 || inexact_up ? 0x7C00 : 0x7BFF));
++    uint32_t q; int cmp, inexact;
++    if (e >= -14) {
++        uint32_t rem = man & 0x1FFF;
++        q = ((uint32_t)(e + 15) << 10) | (man >> 13);
++        cmp = rem < 0x1000 ? -1 : rem == 0x1000 ? 0 : 1;
++        inexact = rem != 0;
++    } else {
++        uint32_t total = man | 0x800000u;
++        int shift = -(e + 1);
++        if (shift > 40) { q = 0; cmp = -1; inexact = 1; }
++        else {
++            uint64_t rem = (uint64_t)total & (((uint64_t)1 << shift) - 1), halfpt = (uint64_t)1 << (shift - 1);
++            q = (uint32_t)((uint64_t)total >> shift);
++            cmp = rem < halfpt ? -1 : rem == halfpt ? 0 : 1;
++            inexact = rem != 0;
++        }
++    }
++    if (inexact) {
++        if (rc == 0) { if (cmp > 0 || (cmp == 0 && (q & 1))) ++q; }
++        else if (inexact_up) ++q;
++    }
++    return (uint16_t)(sign | q);
++}
++
++
++/* AES (the host has no AES-NI) ---------------------------------------------------------------- */
++static uint8_t aes_sbox[256], aes_isbox[256];
++static volatile int aes_ready;
++static uint8_t gmul(uint8_t a, uint8_t b) {
++    uint8_t p = 0;
++    for (int i = 0; i < 8; ++i) { if (b & 1) p ^= a; uint8_t hi = a & 0x80; a = (uint8_t)(a << 1); if (hi) a ^= 0x1B; b >>= 1; }
++    return p;
++}
++static uint8_t rotl8(uint8_t v, int n) { return (uint8_t)((v << n) | (v >> (8 - n))); }
++static void aes_init(void) {
++    if (__atomic_load_n(&aes_ready, __ATOMIC_ACQUIRE)) return;
++    for (int x = 0; x < 256; ++x) {
++        uint8_t inv = 0;
++        if (x) for (int y = 1; y < 256; ++y) if (gmul((uint8_t)x, (uint8_t)y) == 1) { inv = (uint8_t)y; break; }
++        uint8_t v = (uint8_t)(inv ^ rotl8(inv, 1) ^ rotl8(inv, 2) ^ rotl8(inv, 3) ^ rotl8(inv, 4) ^ 0x63);
++        aes_sbox[x] = v; aes_isbox[v] = (uint8_t)x;
++    }
++    __atomic_store_n(&aes_ready, 1, __ATOMIC_RELEASE);
++}
++static void aes_shift_rows(uint8_t *st, int inv) {
++    uint8_t t[16];
++    for (int r = 0; r < 4; ++r) for (int c = 0; c < 4; ++c) {
++        if (!inv) t[r + 4 * c] = st[r + 4 * ((c + r) & 3)]; else t[r + 4 * ((c + r) & 3)] = st[r + 4 * c];
++    }
++    memcpy(st, t, 16);
++}
++static void aes_sub(uint8_t *st, int inv) { for (int i = 0; i < 16; ++i) st[i] = inv ? aes_isbox[st[i]] : aes_sbox[st[i]]; }
++static void aes_mix(uint8_t *st, int inv) {
++    static const uint8_t m[2][4] = {{2, 3, 1, 1}, {14, 11, 13, 9}};
++    for (int c = 0; c < 4; ++c) {
++        uint8_t a[4], r[4];
++        memcpy(a, st + 4 * c, 4);
++        for (int i = 0; i < 4; ++i) {
++            r[i] = 0;
++            for (int j = 0; j < 4; ++j) r[i] ^= gmul(a[j], m[inv][(j - i + 4) & 3]);
++        }
++        memcpy(st + 4 * c, r, 4);
++    }
++}
++static void set_flags_bmi(AvxState *s, int cf, int zf, int sf) {
++    s->rflags = (s->rflags & ~0x8C1ull) | (cf ? 1ull : 0) | (zf ? 0x40ull : 0) | (sf ? 0x80ull : 0);
++}
++
++/* SSE4.2 string compare (pcmpestri/pcmpestrm/pcmpistri/pcmpistrm), legacy and VEX ---------------- */
++static int str_elem(const uint8_t *p, int i, int words, int sgn) {
++    if (words) { uint16_t v; memcpy(&v, p + 2 * i, 2); return sgn ? (int16_t)v : (int)v; }
++    return sgn ? (int8_t)p[i] : (int)p[i];
++}
++static int exec_pcmpstr(AvxState *s, const Dec *d, uint64_t ea, int opc, uint8_t imm, int vex) {
++    const int explicit_len = opc == 0x60 || opc == 0x61, index_out = opc == 0x61 || opc == 0x63;
++    const int words = imm & 1, sgn = (imm >> 1) & 1, agg = (imm >> 2) & 3, pol = (imm >> 4) & 3, msb = (imm >> 6) & 1;
++    const int n = words ? 8 : 16;
++    uint8_t A[16], B[16];
++    memcpy(A, s->xmm[d->reg], 16);
++    get_rm(s, d, ea, 16, B);
++    int la = n, lb = n;
++    if (explicit_len) {
++        int64_t ra = d->W ? (int64_t)s->gpr[0] : (int64_t)(int32_t)s->gpr[0];
++        int64_t rb = d->W ? (int64_t)s->gpr[2] : (int64_t)(int32_t)s->gpr[2];
++        if (ra < 0) ra = -ra;
++        if (rb < 0) rb = -rb;
++        la = ra > n ? n : (int)ra;
++        lb = rb > n ? n : (int)rb;
++    } else {
++        for (la = 0; la < n && str_elem(A, la, words, 0); ++la) {}
++        for (lb = 0; lb < n && str_elem(B, lb, words, 0); ++lb) {}
++    }
++    int bres[16][16];                       /* [index into A][index into B] */
++    for (int i = 0; i < n; ++i)
++        for (int j = 0; j < n; ++j) {
++            const int av = i < la, bv = j < lb;
++            int v;
++            if (!av && !bv) v = agg == 2 || agg == 3;
++            else if (av && !bv) v = 0;
++            else if (!av && bv) v = agg == 3;
++            else {
++                int a = str_elem(A, i, words, sgn), b = str_elem(B, j, words, sgn);
++                v = agg == 1 ? ((i & 1) ? b <= a : b >= a) : a == b;
++            }
++            bres[i][j] = v;
++        }
++    int res1[16];
++    for (int j = 0; j < n; ++j) {
++        int r = 0;
++        if (agg == 0) { for (int i = 0; i < n; ++i) r |= bres[i][j]; }
++        else if (agg == 1) { for (int i = 0; i + 1 < n; i += 2) r |= bres[i][j] && bres[i + 1][j]; }
++        else if (agg == 2) r = bres[j][j];
++        else { r = 1; for (int k = j, i = 0; k < n; ++k, ++i) r &= bres[i][k]; }
++        res1[j] = r;
++    }
++    uint32_t m = 0;
++    for (int j = 0; j < n; ++j) {
++        int r = res1[j];
++        if (pol == 1) r = !r;
++        else if (pol == 3) r = j < lb ? !r : r;
++        m |= (uint32_t)r << j;
++    }
++    if (index_out) s->gpr[1] = m ? (uint64_t)(msb ? 31 - __builtin_clz(m) : __builtin_ctz(m)) : (uint64_t)n;
++    else {
++        uint8_t out[16] = {0};
++        if (!msb) memcpy(out, &m, 2);
++        else for (int j = 0; j < n; ++j) if ((m >> j) & 1) { if (words) { out[2 * j] = 0xFF; out[2 * j + 1] = 0xFF; } else out[j] = 0xFF; }
++        memcpy(s->xmm[0], out, 16);
++        if (vex) memset(s->ymmh[0], 0, 16);
++    }
++    s->rflags = (s->rflags & ~0x8D5ull) | (m ? 1ull : 0) | (lb < n ? 0x40ull : 0) | (la < n ? 0x80ull : 0) | ((m & 1) ? 0x800ull : 0);
++    return 1;
++}
++
++static int exec_soft(AvxState *s, const Dec *d, const Op *o, uint64_t ea) {
++    const int nb = d->L ? 32 : 16;
++    uint8_t a[32] = {0}, b[32] = {0}, out[32] = {0};
++    const uint8_t imm = d->imm;
++    switch (o->id) {
++    case S_INSERTF128:
++        if (!d->L) return 0;
++        get_vec(s, d->vvvv, 32, a); get_rm(s, d, ea, 16, b);
++        memcpy(a + ((imm & 1) ? 16 : 0), b, 16);
++        set_vec(s, d->reg, 32, a);
++        return 1;
++    case S_EXTRACTF128:
++        if (!d->L) return 0;
++        get_vec(s, d->reg, 32, a);
++        if (d->is_mem) memcpy((void *)(uintptr_t)ea, a + ((imm & 1) ? 16 : 0), 16);
++        else { memcpy(s->xmm[d->rm], a + ((imm & 1) ? 16 : 0), 16); memset(s->ymmh[d->rm], 0, 16); }
++        return 1;
++    case S_PERM2F128:
++        if (!d->L) return 0;
++        get_vec(s, d->vvvv, 32, a); get_rm(s, d, ea, 32, b);
++        for (int i = 0; i < 2; ++i) {
++            int ctl = (imm >> (4 * i)) & 0xF;
++            if (ctl & 8) memset(out + 16 * i, 0, 16);
++            else memcpy(out + 16 * i, ((ctl & 2) ? b : a) + 16 * (ctl & 1), 16);
++        }
++        set_vec(s, d->reg, 32, out);
++        return 1;
++    case S_BCASTSS: {
++        uint32_t v;
++        if (d->is_mem) memcpy(&v, (const void *)(uintptr_t)ea, 4); else memcpy(&v, s->xmm[d->rm], 4);
++        for (int i = 0; i < nb / 4; ++i) memcpy(out + 4 * i, &v, 4);
++        set_vec(s, d->reg, nb, out);
++        return 1; }
++    case S_BCASTSD: {
++        if (!d->L) return 0;
++        uint64_t v;
++        if (d->is_mem) memcpy(&v, (const void *)(uintptr_t)ea, 8); else memcpy(&v, s->xmm[d->rm], 8);
++        for (int i = 0; i < 4; ++i) memcpy(out + 8 * i, &v, 8);
++        set_vec(s, d->reg, 32, out);
++        return 1; }
++    case S_BCASTF128:
++        if (!d->L || !d->is_mem) return 0;
++        memcpy(a, (const void *)(uintptr_t)ea, 16);
++        memcpy(out, a, 16); memcpy(out + 16, a, 16);
++        set_vec(s, d->reg, 32, out);
++        return 1;
++    case S_PERMILPS_IMM:
++        get_rm(s, d, ea, nb, a);
++        for (int l = 0; l < nb / 16; ++l)
++            for (int i = 0; i < 4; ++i) memcpy(out + 16 * l + 4 * i, a + 16 * l + 4 * ((imm >> (2 * i)) & 3), 4);
++        set_vec(s, d->reg, nb, out);
++        return 1;
++    case S_PERMILPD_IMM:
++        get_rm(s, d, ea, nb, a);
++        for (int l = 0; l < nb / 16; ++l)
++            for (int j = 0; j < 2; ++j) memcpy(out + 16 * l + 8 * j, a + 16 * l + 8 * ((imm >> (2 * l + j)) & 1), 8);
++        set_vec(s, d->reg, nb, out);
++        return 1;
++    case S_PERMILPS_VAR:
++        get_vec(s, d->vvvv, nb, a); get_rm(s, d, ea, nb, b);
++        for (int l = 0; l < nb / 16; ++l)
++            for (int i = 0; i < 4; ++i) {
++                uint32_t c; memcpy(&c, b + 16 * l + 4 * i, 4);
++                memcpy(out + 16 * l + 4 * i, a + 16 * l + 4 * (c & 3), 4);
++            }
++        set_vec(s, d->reg, nb, out);
++        return 1;
++    case S_PERMILPD_VAR:
++        get_vec(s, d->vvvv, nb, a); get_rm(s, d, ea, nb, b);
++        for (int l = 0; l < nb / 16; ++l)
++            for (int j = 0; j < 2; ++j) {
++                uint64_t c; memcpy(&c, b + 16 * l + 8 * j, 8);
++                memcpy(out + 16 * l + 8 * j, a + 16 * l + 8 * ((c >> 1) & 1), 8);
++            }
++        set_vec(s, d->reg, nb, out);
++        return 1;
++    case S_TESTPS: case S_TESTPD: {
++        const int w = o->id == S_TESTPS ? 4 : 8;
++        get_vec(s, d->reg, nb, a); get_rm(s, d, ea, nb, b);
++        int zf = 1, cf = 1;
++        for (int i = 0; i < nb; i += w) {
++            int sa = (a[i + w - 1] >> 7) & 1, sb = (b[i + w - 1] >> 7) & 1;
++            if (sa & sb) zf = 0;
++            if (!sa && sb) cf = 0;
++        }
++        s->rflags = (s->rflags & ~0x8D5ull) | (zf ? 0x40ull : 0) | (cf ? 1ull : 0);
++        return 1; }
++    case S_MASKLD_PS: case S_MASKLD_PD: {
++        const int w = o->id == S_MASKLD_PS ? 4 : 8;
++        get_vec(s, d->vvvv, nb, a);
++        if (!d->is_mem) return 0;
++        for (int i = 0; i < nb; i += w)
++            if (a[i + w - 1] & 0x80) memcpy(out + i, (const void *)(uintptr_t)(ea + (unsigned)i), (size_t)w);
++        set_vec(s, d->reg, nb, out);
++        return 1; }
++    case S_MASKST_PS: case S_MASKST_PD: {
++        const int w = o->id == S_MASKST_PS ? 4 : 8;
++        get_vec(s, d->vvvv, nb, a); get_vec(s, d->reg, nb, b);
++        if (!d->is_mem) return 0;
++        for (int i = 0; i < nb; i += w)
++            if (a[i + w - 1] & 0x80) memcpy((void *)(uintptr_t)(ea + (unsigned)i), b + i, (size_t)w);
++        return 1; }
++    case S_CVTPH2PS: {
++        const int n = d->L ? 8 : 4;
++        get_rm(s, d, ea, n * 2, a);
++        for (int i = 0; i < n; ++i) { uint16_t h; memcpy(&h, a + 2 * i, 2); uint32_t f; half_to_float_bits(h, &f); memcpy(out + 4 * i, &f, 4); }
++        set_vec(s, d->reg, d->L ? 32 : 16, out);
++        return 1; }
++    case S_CVTPS2PH: {
++        const int n = d->L ? 8 : 4;
++        get_vec(s, d->reg, nb, a);
++        const int rc = (imm & 4) ? (int)((s->mxcsr >> 13) & 3) : (imm & 3);
++        for (int i = 0; i < n; ++i) { uint32_t f; memcpy(&f, a + 4 * i, 4); uint16_t h = float_to_half(f, rc); memcpy(out + 2 * i, &h, 2); }
++        if (d->is_mem) memcpy((void *)(uintptr_t)ea, out, (size_t)n * 2);
++        else { memcpy(s->xmm[d->rm], out, 16); memset(s->ymmh[d->rm], 0, 16); }
++        return 1; }
++    case S_PCMPSTR:
++        if (d->L) return 0;
++        return exec_pcmpstr(s, d, ea, d->opc, imm, 1);
++    case S_LDMXCSR: case S_STMXCSR: {
++        if (d->L || !d->is_mem) return 0;
++        if (d->ext == 2) { uint32_t v; memcpy(&v, (const void *)(uintptr_t)ea, 4); s->mxcsr = v; return 1; }
++        if (d->ext == 3) { memcpy((void *)(uintptr_t)ea, &s->mxcsr, 4); return 1; }
++        return 0; }
++    case S_AESIMC: case S_AESKEYGEN: {
++        if (d->L) return 0;
++        aes_init();
++        get_rm(s, d, ea, 16, b);
++        if (o->id == S_AESIMC) { memcpy(out, b, 16); aes_mix(out, 1); }
++        else {
++            uint32_t x1, x3; memcpy(&x1, b + 4, 4); memcpy(&x3, b + 12, 4);
++            uint32_t sw1 = 0, sw3 = 0;
++            for (int i = 0; i < 4; ++i) { sw1 |= (uint32_t)aes_sbox[(x1 >> (8 * i)) & 0xFF] << (8 * i); sw3 |= (uint32_t)aes_sbox[(x3 >> (8 * i)) & 0xFF] << (8 * i); }
++            uint32_t w[4] = {sw1, ((sw1 >> 8) | (sw1 << 24)) ^ imm, sw3, ((sw3 >> 8) | (sw3 << 24)) ^ imm};
++            memcpy(out, w, 16);
++        }
++        set_vec(s, d->reg, 16, out);
++        return 1; }
++    case S_AESENC: case S_AESENCLAST: case S_AESDEC: case S_AESDECLAST: {
++        if (d->L) return 0;
++        aes_init();
++        get_vec(s, d->vvvv, 16, a); get_rm(s, d, ea, 16, b);
++        const int inv = o->id == S_AESDEC || o->id == S_AESDECLAST, last = o->id == S_AESENCLAST || o->id == S_AESDECLAST;
++        aes_shift_rows(a, inv); aes_sub(a, inv);
++        if (!last) aes_mix(a, inv);
++        for (int i = 0; i < 16; ++i) out[i] = a[i] ^ b[i];
++        set_vec(s, d->reg, 16, out);
++        return 1; }
++    case S_PCLMUL: {
++        if (d->L) return 0;
++        get_vec(s, d->vvvv, 16, a); get_rm(s, d, ea, 16, b);
++        uint64_t x, y, lo = 0, hi = 0;
++        memcpy(&x, a + ((imm & 1) ? 8 : 0), 8); memcpy(&y, b + ((imm & 0x10) ? 8 : 0), 8);
++        for (int i = 0; i < 64; ++i) if ((y >> i) & 1) { lo ^= x << i; if (i) hi ^= x >> (64 - i); }
++        memcpy(out, &lo, 8); memcpy(out + 8, &hi, 8);
++        set_vec(s, d->reg, 16, out);
++        return 1; }
++    case S_ANDN: case S_BEXTR: case S_BLSX: {
++        const int bits = d->W ? 64 : 32;
++        const uint64_t mask = d->W ? ~0ull : 0xFFFFFFFFull;
++        uint64_t src = 0;
++        if (d->is_mem) memcpy(&src, (const void *)(uintptr_t)ea, (size_t)bits / 8); else src = s->gpr[d->rm] & mask;
++        const uint64_t vv = s->gpr[d->vvvv] & mask;
++        uint64_t res;
++        if (o->id == S_ANDN) { res = ~vv & src & mask; s->gpr[d->reg] = res; set_flags_bmi(s, 0, !res, (res >> (bits - 1)) & 1); }
++        else if (o->id == S_BEXTR) {
++            unsigned start = vv & 0xFF, len = (vv >> 8) & 0xFF;
++            res = start >= (unsigned)bits ? 0 : src >> start;
++            if (len < (unsigned)bits) res &= ((uint64_t)1 << len) - 1;
++            res &= mask; s->gpr[d->reg] = res; set_flags_bmi(s, 0, !res, 0);
++        } else {
++            int cf;
++            if (d->ext == 1) { res = src & (src - 1); cf = src == 0; }
++            else if (d->ext == 2) { res = src ^ (src - 1); cf = src == 0; }
++            else if (d->ext == 3) { res = src & (0 - src); cf = src != 0; }
++            else return 0;
++            res &= mask; s->gpr[d->vvvv] = res; set_flags_bmi(s, cf, !res, (res >> (bits - 1)) & 1);
++        }
++        return 1; }
++    case S_PCMPGTQ:
++        if (d->L) return 0;
++        get_vec(s, d->vvvv, 16, a); get_rm(s, d, ea, 16, b);
++        for (int i = 0; i < 2; ++i) {
++            int64_t x, y; memcpy(&x, a + 8 * i, 8); memcpy(&y, b + 8 * i, 8);
++            uint64_t r = x > y ? ~0ull : 0; memcpy(out + 8 * i, &r, 8);
++        }
++        set_vec(s, d->reg, 16, out);
++        return 1;
++    }
++    return 0;
++}
++
++
++/* The few 256-bit forms that mix widths or reduce across lanes. */
++static int exec_l1_special(AvxState *s, const Dec *d, const Op *o, uint64_t ea, int *handled) {
++    *handled = 1;
++    const int opc = d->opc;
++    if (d->map == 1 && opc == 0x50) {                    /* vmovmskps/pd ymm */
++        if (d->is_mem) return 0;
++        uint8_t a[32];
++        get_vec(s, d->rm, 32, a);
++        const int w = d->pp == 1 ? 8 : 4;
++        uint64_t m = 0;
++        for (int i = 0, b = 0; i < 32; i += w, ++b) m |= (uint64_t)((a[i + w - 1] >> 7) & 1) << b;
++        s->gpr[d->reg] = m;
++        return 1;
++    }
++    if (d->map == 2 && opc == 0x17) {                    /* vptest ymm */
++        uint8_t a[32], b[32];
++        get_vec(s, d->reg, 32, a);
++        get_rm(s, d, ea, 32, b);
++        int zf = 1, cf = 1;
++        for (int i = 0; i < 32; ++i) { if (a[i] & b[i]) zf = 0; if ((uint8_t)~a[i] & b[i]) cf = 0; }
++        s->rflags = (s->rflags & ~0x8D5ull) | (zf ? 0x40ull : 0) | (cf ? 1ull : 0);
++        return 1;
++    }
++    if (d->map == 1 && (opc == 0x5A || opc == 0xE6)) {
++        const int widen = (opc == 0x5A && d->pp == 0) || (opc == 0xE6 && d->pp == 2);
++        const int narrow = (opc == 0x5A && d->pp == 1) || (opc == 0xE6 && (d->pp == 1 || d->pp == 3));
++        if (!widen && !narrow) { *handled = 0; return 0; }
++        uint8_t src[32] = {0}, out[32] = {0};
++        get_rm(s, d, ea, widen ? 16 : 32, src);
++        for (int lane = 0; lane < 2; ++lane) {
++            Thunk t; memset(&t, 0, sizeof t);
++            t.mxcsr = s->mxcsr;
++            if (widen) memcpy(t.x[1], src + 8 * lane, 8); else memcpy(t.x[1], src + 16 * lane, 16);
++            uint8_t code[16];
++            int n = build_legacy(code, d, o, 3, 0, 1, 0, 0);
++            const void *thunk = get_thunk(code, n);
++            if (!thunk) return 0;
++            call_thunk(thunk, &t);
++            s->mxcsr = t.mxcsr;
++            if (widen) memcpy(out + 16 * lane, t.x[0], 16); else memcpy(out + 8 * lane, t.x[0], 8);
++        }
++        set_vec(s, d->reg, widen ? 32 : 16, out);
++        return 1;
++    }
++    *handled = 0;
++    return 0;
++}
++
++/* vcmpps/pd/ss/sd with predicates 8..31 (legacy cmpps only has 0..7): built from the legacy ones. */
++static int exec_cmp_ext(AvxState *s, const Dec *d, const Op *o, uint64_t ea) {
++    enum { N, OR, AND, FALSE_, TRUE_ };
++    static const uint8_t t[24][3] = {
++        {0,3,OR},{3,1,OR},{3,2,OR},{0,0,FALSE_},{7,4,AND},{5,7,AND},{6,7,AND},{0,0,TRUE_},
++        {0,0,N},{1,0,N},{2,0,N},{3,0,N},{4,0,N},{5,0,N},{6,0,N},{7,0,N},
++        {0,3,OR},{3,1,OR},{3,2,OR},{0,0,FALSE_},{7,4,AND},{5,7,AND},{6,7,AND},{0,0,TRUE_}};
++    const uint8_t *e = t[d->imm - 8];
++    Dec dd = *d;
++    AvxState t1 = *s, t2 = *s;
++    dd.imm = e[0];
++    if (!exec_legacy(&t1, &dd, o, ea)) return 0;
++    const int lanes = ((o->fl & F_YMM) && d->L) ? 2 : 1;
++    const int scalar = d->pp >= 2, w = d->pp == 3 ? 8 : 4;
++    if (e[2] == OR || e[2] == AND) {
++        dd.imm = e[1];
++        if (!exec_legacy(&t2, &dd, o, ea)) return 0;
++        for (int l = 0; l < lanes; ++l) {
++            uint8_t *x = l ? t1.ymmh[d->reg] : t1.xmm[d->reg], *y = l ? t2.ymmh[d->reg] : t2.xmm[d->reg];
++            for (int i = 0; i < 16; ++i) x[i] = e[2] == OR ? (uint8_t)(x[i] | y[i]) : (uint8_t)(x[i] & y[i]);
++        }
++    } else if (e[2] == FALSE_ || e[2] == TRUE_) {
++        for (int l = 0; l < lanes; ++l) {
++            uint8_t *x = l ? t1.ymmh[d->reg] : t1.xmm[d->reg];
++            memset(x, e[2] == TRUE_ ? 0xFF : 0, scalar ? (size_t)w : 16);
++        }
++    }
++    memcpy(s->xmm[d->reg], t1.xmm[d->reg], 16);
++    memcpy(s->ymmh[d->reg], t1.ymmh[d->reg], 16);
++    s->mxcsr = t1.mxcsr | t2.mxcsr;
++    return 1;
++}
++
++/* ------------------------------------------------------------------------------------------ */
++/* Entry points                                                                                 */
++/* ------------------------------------------------------------------------------------------ */
++static int emulate_vex(AvxState *s, const uint8_t *p, char *why, size_t why_size) {
++    Dec d;
++    memset(&d, 0, sizeof d);
++    int i;
++    int rexr, rexx = 0, rexb = 0;
++    if (p[0] == 0xC5) {
++        rexr = !(p[1] & 0x80);
++        d.vvvv = (~p[1] >> 3) & 15; d.L = (p[1] >> 2) & 1; d.pp = p[1] & 3; d.map = 1;
++        i = 2;
++    } else {
++        rexr = !(p[1] & 0x80); rexx = !(p[1] & 0x40); rexb = !(p[1] & 0x20);
++        d.map = p[1] & 31; d.W = p[2] >> 7;
++        d.vvvv = (~p[2] >> 3) & 15; d.L = (p[2] >> 2) & 1; d.pp = p[2] & 3;
++        i = 3;
++    }
++    d.opc = p[i++];
++    Op o;
++    if (!find_op(&d, &o)) return fail(why, why_size, p, "AVX: opcode not in table");
++    if (o.fl & F_ZERO) {
++        for (int r = 0; r < 16; ++r) { memset(s->ymmh[r], 0, 16); if (d.L) memset(s->xmm[r], 0, 16); }
++        return i;
++    }
++    decode_modrm(p, &i, &d, rexr, rexx, rexb);
++    if (o.fl & F_IMM) { d.has_imm = 1; d.imm = p[i++]; }
++    d.len = i;
++    uint64_t ea = d.is_mem ? effective_address(s, &d, p) : 0;
++    int ok;
++    if (o.fl & F_SOFT) ok = exec_soft(s, &d, &o, ea);
++    else if (o.fl & F_SHIFTI) ok = exec_shifti(s, &d, &o);
++    else if (o.fl & F_BLENDV) ok = exec_blendv(s, &d, ea);
++    else {
++        if (d.L && !(o.fl & F_YMM)) {
++            int handled;
++            ok = exec_l1_special(s, &d, &o, ea, &handled);
++            if (handled) return ok ? d.len : fail(why, why_size, p, "AVX: unsupported 256-bit form");
++        }
++        if (d.L && !allows_l1(&o)) return fail(why, why_size, p, "AVX: 256-bit form not supported");
++        if (o.map == 1 && o.opc == 0xC2 && d.imm >= 8) ok = exec_cmp_ext(s, &d, &o, ea);
++        else ok = exec_legacy(s, &d, &o, ea);
++    }
++    return ok ? d.len : fail(why, why_size, p, "AVX: unsupported form");
++}
++
++/* Legacy (non-VEX) instructions the host lacks: POPCNT, CRC32, PCMPGTQ. */
++static int emulate_legacy(AvxState *s, const uint8_t *p, char *why, size_t why_size) {
++    int i = 0, opsize16 = 0, rep = 0, repne = 0, rexw = 0, rexr = 0, rexx = 0, rexb = 0;
++    for (;; ++i) {
++        if (p[i] == 0x66) opsize16 = 1;
++        else if (p[i] == 0xF3) rep = 1;
++        else if (p[i] == 0xF2) repne = 1;
++        else break;
++    }
++    if ((p[i] & 0xF0) == 0x40) { rexw = (p[i] >> 3) & 1; rexr = (p[i] >> 2) & 1; rexx = (p[i] >> 1) & 1; rexb = p[i] & 1; ++i; }
++    if (p[i++] != 0x0F) return fail(why, why_size, p, "legacy: not 0F");
++    Dec d; memset(&d, 0, sizeof d);
++    int op = p[i++];
++    if (rep && op == 0xB8) {                                            /* POPCNT */
++        decode_modrm(p, &i, &d, rexr, rexx, rexb);
++        d.len = i;
++        uint64_t v;
++        const int bytes = rexw ? 8 : opsize16 ? 2 : 4;
++        if (d.is_mem) { v = 0; memcpy(&v, (const void *)(uintptr_t)effective_address(s, &d, p), (size_t)bytes); }
++        else { v = s->gpr[d.rm]; if (bytes < 8) v &= (1ull << (bytes * 8)) - 1; }
++        uint64_t r = (uint64_t)__builtin_popcountll(v);
++        if (bytes == 2) s->gpr[d.reg] = (s->gpr[d.reg] & ~0xFFFFull) | r;
++        else s->gpr[d.reg] = r;
++        s->rflags &= ~0x8D5ull;
++        if (!v) s->rflags |= 0x40;
++        return d.len;
++    }
++    if (opsize16 && op == 0x38 && p[i] == 0x37) {                       /* PCMPGTQ xmm, xmm/m128 */
++        ++i;
++        decode_modrm(p, &i, &d, rexr, rexx, rexb);
++        d.len = i;
++        uint8_t b[16];
++        if (d.is_mem) memcpy(b, (const void *)(uintptr_t)effective_address(s, &d, p), 16); else memcpy(b, s->xmm[d.rm], 16);
++        for (int k = 0; k < 2; ++k) {
++            int64_t x, y; memcpy(&x, s->xmm[d.reg] + 8 * k, 8); memcpy(&y, b + 8 * k, 8);
++            uint64_t r = x > y ? ~0ull : 0; memcpy(s->xmm[d.reg] + 8 * k, &r, 8);
++        }
++        return d.len;
++    }
++    if (opsize16 && op == 0x3A && p[i] >= 0x60 && p[i] <= 0x63) {     /* PCMPESTRI/M, PCMPISTRI/M */
++        int opc = p[i++];
++        decode_modrm(p, &i, &d, rexr, rexx, rexb);
++        uint8_t imm = p[i++];
++        d.len = i; d.W = rexw;
++        uint64_t ea = d.is_mem ? effective_address(s, &d, p) : 0;
++        exec_pcmpstr(s, &d, ea, opc, imm, 0);
++        return d.len;
++    }
++    if (!repne && op == 0x38 && (p[i] == 0xF0 || p[i] == 0xF1)) {       /* MOVBE (memory only) */
++        const int load = p[i] == 0xF0;
++        ++i;
++        decode_modrm(p, &i, &d, rexr, rexx, rexb);
++        d.len = i;
++        if (!d.is_mem) return fail(why, why_size, p, "legacy: movbe needs memory");
++        const int bytes = rexw ? 8 : opsize16 ? 2 : 4;
++        uint8_t *m = (uint8_t *)(uintptr_t)effective_address(s, &d, p), tmp[8] = {0};
++        if (load) {
++            uint64_t v = 0;
++            for (int k = 0; k < bytes; ++k) v |= (uint64_t)m[bytes - 1 - k] << (8 * k);
++            if (bytes == 2) s->gpr[d.reg] = (s->gpr[d.reg] & ~0xFFFFull) | v; else s->gpr[d.reg] = v;
++        } else {
++            for (int k = 0; k < bytes; ++k) tmp[k] = (uint8_t)(s->gpr[d.reg] >> (8 * (bytes - 1 - k)));
++            memcpy(m, tmp, (size_t)bytes);
++        }
++        return d.len;
++    }
++    if (repne && op == 0x38 && (p[i] == 0xF0 || p[i] == 0xF1)) {        /* CRC32 (Castagnoli) */
++        const int byte_form = p[i] == 0xF0;
++        ++i;
++        decode_modrm(p, &i, &d, rexr, rexx, rexb);
++        d.len = i;
++        const int bytes = byte_form ? 1 : rexw ? 8 : opsize16 ? 2 : 4;
++        uint64_t v = 0;
++        if (d.is_mem) memcpy(&v, (const void *)(uintptr_t)effective_address(s, &d, p), (size_t)bytes);
++        else { v = s->gpr[d.rm]; if (bytes < 8) v &= (1ull << (bytes * 8)) - 1; }
++        uint32_t crc = (uint32_t)s->gpr[d.reg];
++        for (int k = 0; k < bytes; ++k) {
++            crc ^= (uint32_t)((v >> (8 * k)) & 0xFF);
++            for (int b = 0; b < 8; ++b) crc = (crc >> 1) ^ (0x82F63B78u & (0u - (crc & 1)));
++        }
++        s->gpr[d.reg] = crc;
++        return d.len;
++    }
++    return fail(why, why_size, p, "legacy: unsupported");
++}
++
++int avx_emulate(AvxState *s, const uint8_t *insn, char *why, size_t why_size) {
++    if (insn[0] == 0xC4 || insn[0] == 0xC5) return emulate_vex(s, insn, why, why_size);
++    return emulate_legacy(s, insn, why, why_size);
++}
++
++int avx_emulate_run(AvxState *s, const uint8_t *insn, int max_insns, int *count, char *why, size_t why_size) {
++    int total = 0, n = 0;
++    while (n < max_insns) {
++        const uint8_t *p = insn + total;
++        if (n && p[0] != 0xC4 && p[0] != 0xC5) break;        /* only straight runs of VEX code */
++        int len = avx_emulate(s, p, n ? NULL : why, n ? 0 : why_size);
++        if (!len) break;
++        total += len;
++        ++n;
++    }
++    *count = n;
++    return total;
++}
+diff -ruN -x out a/src/avx_emulate.h CTR-NitroFueled-PC-0.4/src/avx_emulate.h
+--- a/src/avx_emulate.h	1970-01-01 00:00:00.000000000 +0000
++++ b/src/avx_emulate.h	2026-10-20 03:02:45.475998613 +0000
+@@ -0,0 +1,37 @@
++/* Emulation of the guest's AVX (VEX), POPCNT and SSE4.2 instructions on hosts that lack them
++ * (Core 2 / Penryn, e.g. Q8400, which stops at SSE4.1). The guest code is compiled for the PS4's
++ * Jaguar CPU: AVX 128/256 bit, F16C, no AVX2.
++ *
++ * Design: a VEX instruction that has a legacy SSE twin (nearly all of them) is rebuilt as that
++ * legacy instruction and executed natively on fixed registers (xmm0..xmm3, rax, [rbx] = an
++ * aligned temp), so the host CPU itself produces the result. The 256-bit upper halves live in a
++ * per-thread shadow (AvxState.ymmh). Instructions with no legacy twin (vinsertf128, vpermilps,
++ * vbroadcast*, vmaskmov*, vtestps, vcvtph2ps, vpcmpgtq...) are done in portable C.
++ *
++ * Runs inside the exception handler, one instruction per call. Not fast: every call is a full
++ * exception dispatch. It exists to get the game running; hot sites are for a later rewrite. */
++#ifndef BB_AVX_EMULATE_H
++#define BB_AVX_EMULATE_H
++#include <stddef.h>
++#include <stdint.h>
++
++typedef struct {
++    uint64_t gpr[16];          /* x86 numbering; gpr[4] = rsp */
++    uint8_t xmm[16][16];       /* low 128 bits of xmm/ymm */
++    uint8_t ymmh[16][16];      /* bits 255:128 (shadow: the host has no ymm) */
++    uint64_t rflags;
++    uint32_t mxcsr;
++} AvxState;
++
++/* Executes the instruction at `insn` on `s`. Returns its length (> 0) on success, 0 when it is
++ * not supported (`why` gets one line with the opcode bytes). rip-relative operands are resolved
++ * against `insn` itself: guest addresses are host addresses in this port. */
++int avx_emulate(AvxState *s, const uint8_t *insn, char *why, size_t why_size);
++
++/* Emulates the instruction at `insn` and keeps going through the VEX instructions that directly
++ * follow it (up to max_insns): one fault then covers a whole run of AVX code. Stops, without
++ * error, at the first instruction that is not VEX or not supported. Returns the bytes consumed
++ * (0 when the first instruction fails, `why` is set then) and the instruction count in *count. */
++int avx_emulate_run(AvxState *s, const uint8_t *insn, int max_insns, int *count, char *why, size_t why_size);
++
++#endif
+diff -ruN -x out a/src/probe.c CTR-NitroFueled-PC-0.4/src/probe.c
+--- a/src/probe.c	2026-10-19 04:51:11.000000000 +0000
++++ b/src/probe.c	2026-10-21 04:00:20.883423142 +0000
+@@ -9,6 +9,7 @@
+ #include "runtime.h"
+ #include "gpu/bbgpu.h"
+ #include "isa_rewrite.h"
++#include "avx_emulate.h"
+ #if !defined(__x86_64__) || !defined(__GNUC__)
+ #error This prototype requires x86-64 GCC or Clang (including MinGW).
+ #endif
+@@ -46,6 +47,55 @@
+ static unsigned cpu_missing_sets; /* CPU_SET_* the host lacks; the guest code needs them rewritten */
+ static IsaTable *isa_table; /* rewritten sites (--isa-rewrite); the fault handlers and the report read it */
+ static void isa_report_hook(void) { isa_rewrite_report(isa_table, stdout); }
++/* AVX / SSE4.2 / POPCNT emulation (src/avx_emulate.c): a host CPU without them (Core 2 and older, no
++ * AVX before Sandy Bridge) raises an illegal instruction at each one; the fault handlers emulate
++ * it and resume after it. Very slow (a full exception per instruction), but it runs. The guest's
++ * ymm upper halves, which the host cannot hold, live in a per-thread shadow. BB_AVX_EMULATE=0
++ * turns it off (the old STOP). */
++static int avx_emulation;
++static unsigned long long avx_emulated;
++typedef struct { uintptr_t rip; uint8_t bytes[8]; int count; } AvxHist;
++typedef struct { unsigned long tid; uint8_t ymmh[16][16]; AvxHist hist[16]; unsigned hist_n; } AvxThread;
++static int avx_run_max = 128;   /* BB_AVX_RUN_MAX=1 turns the batching off (one instruction per fault) */
++static void avx_record(AvxThread *t, uintptr_t rip, int count) {
++    AvxHist *h = &t->hist[t->hist_n++ & 15];
++    h->rip = rip; h->count = count;
++    memcpy(h->bytes, (const void *)rip, 8);
++}
++static AvxThread avx_threads[512];
++#ifdef _WIN32
++#define AVX_TID() ((unsigned long)GetCurrentThreadId())
++#else
++#define AVX_TID() ((unsigned long)syscall(SYS_gettid))
++#endif
++static AvxThread *avx_thread(void) {
++    const unsigned long tid = AVX_TID();
++    for (unsigned i = 0; i < 512; ++i) {
++        AvxThread *t = &avx_threads[(unsigned)(tid * 2654435761u + i) & 511];
++        unsigned long cur = __atomic_load_n(&t->tid, __ATOMIC_ACQUIRE), zero = 0;
++        if (cur == tid) return t;
++        if (!cur && __atomic_compare_exchange_n(&t->tid, &zero, tid, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return t;
++    }
++    return NULL;
++}
++static unsigned long long avx_traps;
++static void avx_count(int instructions) {
++    unsigned long long traps = __atomic_add_fetch(&avx_traps, 1, __ATOMIC_RELAXED);
++    unsigned long long n = __atomic_add_fetch(&avx_emulated, (unsigned long long)instructions, __ATOMIC_RELAXED);
++    if ((n >> 20) != ((n - (unsigned long long)instructions) >> 20)) {
++        fprintf(stderr, "AVX emulation: %llu instructions in %llu faults so far\n", n, traps);
++        fflush(stderr);
++    }
++}
++static void cpu_set_names(unsigned mask, char *out, size_t size) {
++    static const struct { unsigned bit; const char *name; } t[] = {{CPU_SET_MOVBE, "MOVBE"}, {CPU_SET_F16C, "F16C"}, {CPU_SET_BMI1, "BMI1"}, {CPU_SET_LZCNT, "LZCNT"}};
++    size_t used = 0;
++    if (size) out[0] = 0;
++    for (size_t i = 0; i < sizeof t / sizeof *t; ++i) {
++        if (!(mask & t[i].bit) || used + 8 >= size) continue;
++        used += (size_t)snprintf(out + used, size - used, "%s%s", used ? ", " : "", t[i].name);
++    }
++}
+ int vulkan_smoke(void);
+ 
+ static void fail(const char *message) { fprintf(stderr, "ERROR: %s\n", message); exit(1); }
+@@ -60,14 +110,29 @@
+ static int cpu_supported(char *missing, size_t size) {
+     missing[0] = 0;
+     const char *skip = getenv("BB_SKIP_CPU_CHECK");
+-    if (skip && !strcmp(skip, "1")) return 1;
+     const CpuFeatureWords words = cpu_feature_words();
+-    if (cpu_missing_fatal(words, missing, size)) {
++    int fatal = cpu_missing_fatal(words, missing, size);
++    const char *emulate = getenv("BB_AVX_EMULATE");
++    if (fatal && !(emulate && !strcmp(emulate, "0"))) {   /* on even when the check is skipped: that is when it matters */
++        avx_emulation = 1;
++        const char *run_max = getenv("BB_AVX_RUN_MAX");
++        if (run_max && atoi(run_max) > 0) avx_run_max = atoi(run_max);
++        printf("CPU: lacks %s, emulated in software (very slow), up to %d AVX instructions per fault\n", missing, avx_run_max);
++        fatal = 0;
++    }
++    /* BB_SKIP_CPU_CHECK=1 skips the rest, except when the emulation is on: then LZCNT/TZCNT/BMI1/MOVBE still
++     * need their rewrite (LZCNT and TZCNT do not fault: without the rewrite they silently give wrong results). */
++    if (skip && !strcmp(skip, "1") && !avx_emulation) return 1;
++    if (fatal) {
+         printf("STOP: this CPU lacks instruction sets the game's code uses: %s "
+                "(Intel Sandy Bridge 2011 or newer, or AMD FX or newer, is needed)\n", missing);
+         return 0;
+     }
+     cpu_missing_sets = cpu_missing_rewritable(words, missing, size);
++    if (avx_emulation && (cpu_missing_sets & CPU_SET_F16C)) {   /* vcvtph2ps/vcvtps2ph are emulated with the rest */
++        cpu_missing_sets &= ~(unsigned)CPU_SET_F16C;
++        cpu_set_names(cpu_missing_sets, missing, size);
++    }
+     return 1;
+ }
+ static uint64_t read64(FILE *f) {
+@@ -185,6 +250,33 @@
+     for (int i=0;i<16;++i) { if (to_context) *g[i]=regs->gpr[i]; else regs->gpr[i]=*g[i]; }
+     if (to_context) c->EFlags=(DWORD)regs->rflags; else regs->rflags=c->EFlags;
+ }
++/* Emulates the AVX/POPCNT/SSE4.2 instruction at Rip (an illegal instruction on this CPU). */
++static int avx_handle_context(CONTEXT *c) {
++    AvxThread *t = avx_thread();
++    if (!t) return 0;
++    AvxState st;
++    IsaRegs regs;
++    isa_context_regs(c, &regs, 0);
++    memcpy(st.gpr, regs.gpr, sizeof st.gpr);
++    st.rflags = regs.rflags;
++    for (int i = 0; i < 16; ++i) memcpy(st.xmm[i], &c->FltSave.XmmRegisters[i], 16);
++    memcpy(st.ymmh, t->ymmh, sizeof st.ymmh);
++    st.mxcsr = c->MxCsr;
++    char why[200];
++    int count = 0;
++    int len = avx_emulate_run(&st, (const uint8_t *)(uintptr_t)c->Rip, avx_run_max, &count, why, sizeof why);
++    if (!len) { fprintf(stderr, "AVX emulation stopped: %s\n", why); fflush(stderr); return 0; }
++    memcpy(regs.gpr, st.gpr, sizeof st.gpr);
++    regs.rflags = st.rflags;
++    isa_context_regs(c, &regs, 1);
++    for (int i = 0; i < 16; ++i) memcpy(&c->FltSave.XmmRegisters[i], st.xmm[i], 16);
++    memcpy(t->ymmh, st.ymmh, sizeof st.ymmh);
++    c->MxCsr = st.mxcsr;
++    avx_record(t, (uintptr_t)c->Rip, count);
++    c->Rip += (DWORD64)len;
++    avx_count(count);
++    return 1;
++}
+ const char *runtime_thread_current_name(void);
+ static int fatal_reported;
+ static LONG fatal_exception(EXCEPTION_POINTERS *info) {
+@@ -193,6 +285,27 @@
+     const CONTEXT *c=info->ContextRecord;
+     char where[MAX_PATH+64];
+     describe_address(where,sizeof(where),(uintptr_t)c->Rip);
++    {   /* extra context for the report: emulation counters and the machine's memory (a failed allocation shows up as a null pointer) */
++        MEMORYSTATUSEX ms;
++        ms.dwLength=sizeof ms;
++        if (GlobalMemoryStatusEx(&ms)) fprintf(stderr,"Memory: physical %llu of %llu MiB free, commit %llu of %llu MiB free, address space %llu MiB free\n",
++            (unsigned long long)(ms.ullAvailPhys>>20),(unsigned long long)(ms.ullTotalPhys>>20),(unsigned long long)(ms.ullAvailPageFile>>20),
++            (unsigned long long)(ms.ullTotalPageFile>>20),(unsigned long long)(ms.ullAvailVirtual>>20));
++        fprintf(stderr,"AVX emulation: %s, %llu instructions in %llu faults\n",avx_emulation?"on":"off",avx_emulated,avx_traps);
++        if (avx_emulation) {
++            AvxThread *t=avx_thread();
++            if (t) {
++                fprintf(stderr,"Last AVX emulations on this thread (oldest first):\n");
++                for (unsigned i=0;i<16;++i) {
++                    const AvxHist *h=&t->hist[(t->hist_n+i)&15];
++                    if (!h->rip) continue;
++                    char w[MAX_PATH+64];
++                    describe_address(w,sizeof(w),h->rip);
++                    fprintf(stderr,"  %s  %02x %02x %02x %02x %02x %02x %02x %02x  x%d\n",w,h->bytes[0],h->bytes[1],h->bytes[2],h->bytes[3],h->bytes[4],h->bytes[5],h->bytes[6],h->bytes[7],h->count);
++                }
++            }
++        }
++    }
+     if (record->ExceptionCode==EXCEPTION_ACCESS_VIOLATION && record->NumberParameters>=2)
+         fprintf(stderr,"Fault: %s access to %p at %s (thread %lu)\n",
+                 record->ExceptionInformation[0]==1 ? "write" : record->ExceptionInformation[0]==8 ? "execute" : "read",
+@@ -265,6 +378,11 @@
+ static LONG CALLBACK vectored_fault(EXCEPTION_POINTERS *info) {
+     const EXCEPTION_RECORD *record=info->ExceptionRecord;
+     DWORD code=record->ExceptionCode;
++    if (code==EXCEPTION_ILLEGAL_INSTRUCTION && avx_emulation && avx_handle_context(info->ContextRecord)) return EXCEPTION_CONTINUE_EXECUTION;
++    if (code==EXCEPTION_ILLEGAL_INSTRUCTION && !avx_emulation) {
++        const unsigned char *b=(const unsigned char *)(uintptr_t)info->ContextRecord->Rip;
++        fprintf(stderr,"Illegal instruction at Rip: %02x %02x %02x %02x %02x %02x %02x %02x (AVX emulation is off: not needed on this CPU, or BB_AVX_EMULATE=0)\n",b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7]);
++    }
+     if (code==EXCEPTION_BREAKPOINT && isa_table) {
+         /* An int3 ISA site: emulated here; any other breakpoint goes on to the report below. */
+         IsaRegs regs;
+@@ -328,7 +446,33 @@
+ /* ucontext gregs of IsaRegs.gpr (x86 numbering). */
+ static const int isa_gregs[16]={REG_RAX,REG_RCX,REG_RDX,REG_RBX,REG_RSP,REG_RBP,REG_RSI,REG_RDI,
+                                 REG_R8,REG_R9,REG_R10,REG_R11,REG_R12,REG_R13,REG_R14,REG_R15};
++static int avx_handle_ucontext(ucontext_t *uc) {
++    AvxThread *t = avx_thread();
++    if (!t || !uc->uc_mcontext.fpregs) return 0;
++    greg_t *g = uc->uc_mcontext.gregs;
++    struct _libc_fpstate *fp = uc->uc_mcontext.fpregs;
++    AvxState st;
++    for (int i = 0; i < 16; ++i) st.gpr[i] = (uint64_t)g[isa_gregs[i]];
++    st.rflags = (uint64_t)g[REG_EFL];
++    for (int i = 0; i < 16; ++i) memcpy(st.xmm[i], fp->_xmm[i].element, 16);
++    memcpy(st.ymmh, t->ymmh, sizeof st.ymmh);
++    st.mxcsr = fp->mxcsr;
++    char why[200];
++    int count = 0;
++    int len = avx_emulate_run(&st, (const uint8_t *)(uintptr_t)g[REG_RIP], avx_run_max, &count, why, sizeof why);
++    if (!len) { fprintf(stderr, "AVX emulation stopped: %s\n", why); fflush(stderr); return 0; }
++    for (int i = 0; i < 16; ++i) g[isa_gregs[i]] = (greg_t)st.gpr[i];
++    g[REG_EFL] = (greg_t)st.rflags;
++    for (int i = 0; i < 16; ++i) memcpy(fp->_xmm[i].element, st.xmm[i], 16);
++    memcpy(t->ymmh, st.ymmh, sizeof st.ymmh);
++    fp->mxcsr = st.mxcsr;
++    avx_record(t, (uintptr_t)g[REG_RIP], count);
++    g[REG_RIP] += len;
++    avx_count(count);
++    return 1;
++}
+ static void fault(int sig, siginfo_t *info, void *context) {
++    if (sig == SIGILL && avx_emulation && avx_handle_ucontext((ucontext_t *)context)) return;
+     if (sig == SIGTRAP && isa_table) {
+         /* An int3 ISA site (RIP is past the CC byte); any other trap ends in the report below. */
+         greg_t *g = ((ucontext_t *)context)->uc_mcontext.gregs;
+@@ -615,6 +759,7 @@
+     /* BB_ISA_REWRITE=0 never rewrites, =1 rewrites every site; by default the sets the CPU lacks. */
+     const char *policy = getenv("BB_ISA_REWRITE");
+     unsigned isa_sets = policy && !strcmp(policy, "1") ? 0xffffffffu : policy && !strcmp(policy, "0") ? 0 : cpu_missing_sets;
++    if (avx_emulation) isa_sets &= ~(unsigned)CPU_SET_F16C;   /* F16C sites are emulated at run time, not rewritten */
+     if (cpu_missing_sets && !isa_sets) {
+         printf("STOP: this CPU lacks %s and the rewrite is disabled (BB_ISA_REWRITE=0)\n", missing);
+         return 20;
+diff -ruN -x out a/tests/test_avx_emulate.c CTR-NitroFueled-PC-0.4/tests/test_avx_emulate.c
+--- a/tests/test_avx_emulate.c	1970-01-01 00:00:00.000000000 +0000
++++ b/tests/test_avx_emulate.c	2026-10-20 08:03:36.616148811 +0000
+@@ -0,0 +1,277 @@
++/* Verifies src/avx_emulate.c against real AVX hardware: every instruction listed in the samples
++ * file (hex bytes, one per line; scripts/avx_samples.py makes it from eboot.bin) is run natively
++ * and through the emulator on the same random register/memory state, and the results are compared.
++ * Needs a host CPU with AVX + F16C. Linux only.
++ *   gcc -O1 -mno-red-zone -I src tests/test_avx_emulate.c -o out/avx-test && out/avx-test samples.txt */
++#define _GNU_SOURCE
++#include "../src/avx_emulate.c"
++#include <setjmp.h>
++#include <signal.h>
++#include <stdlib.h>
++
++typedef struct { uint64_t gpr[16]; uint8_t ymm[16][32]; uint64_t flags; uint32_t mxcsr, pad; } NState;
++void native_run(NState *st, const void *code);
++__asm__(
++    ".text\n.globl native_run\nnative_run:\n"
++    "pushq %rbp\npushq %rbx\npushq %r12\npushq %r13\npushq %r14\npushq %r15\n"
++    "pushq %rdi\npushq %rsi\n"
++    "movq %rdi, %rax\n"
++#define LD(i) "vmovups " #i "*32+128(%rax), %ymm" #i "\n"
++    LD(0) LD(1) LD(2) LD(3) LD(4) LD(5) LD(6) LD(7) LD(8) LD(9) LD(10) LD(11) LD(12) LD(13) LD(14) LD(15)
++    "ldmxcsr 648(%rax)\n"
++    "pushq 640(%rax)\npopfq\n"
++    "movq 8(%rax),%rcx\nmovq 16(%rax),%rdx\nmovq 24(%rax),%rbx\nmovq 40(%rax),%rbp\nmovq 48(%rax),%rsi\nmovq 56(%rax),%rdi\n"
++    "movq 64(%rax),%r8\nmovq 72(%rax),%r9\nmovq 80(%rax),%r10\nmovq 88(%rax),%r11\n"
++    "movq 96(%rax),%r12\nmovq 104(%rax),%r13\nmovq 112(%rax),%r14\nmovq 120(%rax),%r15\n"
++    "movq 0(%rax),%rax\n"
++    "call *(%rsp)\n"
++    "pushq %rax\nmovq 16(%rsp),%rax\n"
++    "movq %rcx,8(%rax)\nmovq %rdx,16(%rax)\nmovq %rbx,24(%rax)\nmovq %rbp,40(%rax)\nmovq %rsi,48(%rax)\nmovq %rdi,56(%rax)\n"
++    "movq %r8,64(%rax)\nmovq %r9,72(%rax)\nmovq %r10,80(%rax)\nmovq %r11,88(%rax)\n"
++    "movq %r12,96(%rax)\nmovq %r13,104(%rax)\nmovq %r14,112(%rax)\nmovq %r15,120(%rax)\n"
++    "popq %rcx\nmovq %rcx,0(%rax)\n"
++#define ST(i) "vmovups %ymm" #i ", " #i "*32+128(%rax)\n"
++    ST(0) ST(1) ST(2) ST(3) ST(4) ST(5) ST(6) ST(7) ST(8) ST(9) ST(10) ST(11) ST(12) ST(13) ST(14) ST(15)
++    "stmxcsr 648(%rax)\npushfq\npopq 640(%rax)\nvzeroupper\n"
++    "addq $16,%rsp\n"
++    "popq %r15\npopq %r14\npopq %r13\npopq %r12\npopq %rbx\npopq %rbp\nret\n");
++
++static sigjmp_buf trap;
++static void on_signal(int sig) { (void)sig; siglongjmp(trap, 1); }
++
++static uint64_t rng = 0x9E3779B97F4A7C15ull;
++static uint64_t rnd(void) { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; return rng; }
++static uint32_t rnd32(void) {
++    switch (rnd() % 5) {
++    case 0: return (uint32_t)rnd();
++    case 1: { float f = (float)((int64_t)(rnd() % 200001) - 100000) / 100.0f; uint32_t u; memcpy(&u, &f, 4); return u; }
++    case 2: return (uint32_t)((int)(rnd() % 40) - 8);
++    case 3: { static const uint32_t sp[] = {0, 0x80000000u, 0x7F800000u, 0xFF800000u, 0x7FC00000u, 0x3F800000u, 0x00000001u, 0xFFFFFFFFu, 0x7F7FFFFFu};
++              return sp[rnd() % 9]; }
++    default: { float f = (float)((int64_t)(rnd() % 2001) - 1000) / 7.0f; uint32_t u; memcpy(&u, &f, 4); return u; }
++    }
++}
++static void fill(uint8_t *p, size_t n) {
++    for (size_t i = 0; i + 8 <= n; i += 8) {
++        if (rnd() & 1) { double x = (double)((int64_t)(rnd() % 2000001) - 1000000) / 1000.0; memcpy(p + i, &x, 8); }
++        else { uint32_t a = rnd32(), b = rnd32(); memcpy(p + i, &a, 4); memcpy(p + i + 4, &b, 4); }
++    }
++}
++
++typedef struct { const char *why; int n; char text[160]; } Reason;
++static Reason reasons[4000];
++static int nreasons;
++static void note(const char *why) {
++    char key[160]; snprintf(key, sizeof key, "%s", why);
++    char *colon = strchr(key, ':'); if (colon) { colon = strchr(colon + 1, ':'); if (colon) *colon = 0; }
++    /* group by message and the first bytes that identify the opcode */
++    char k2[160]; snprintf(k2, sizeof k2, "%s", why);
++    for (int i = 0; i < nreasons; ++i) if (!strncmp(reasons[i].text, k2, 40) && !strncmp(reasons[i].text, k2, strlen(k2) > 46 ? 46 : strlen(k2))) { reasons[i].n++; return; }
++    if (nreasons < 4000) { snprintf(reasons[nreasons].text, 160, "%s", k2); reasons[nreasons].n = 1; ++nreasons; }
++}
++
++int main(int argc, char **argv) {
++    if (argc < 2) { fprintf(stderr, "usage: avx-test samples.txt [rounds]\n"); return 2; }
++    const int rounds = argc > 2 ? atoi(argv[2]) : 3;
++    FILE *f = fopen(argv[1], "r");
++    if (!f) { perror("samples"); return 2; }
++    struct sigaction sa; memset(&sa, 0, sizeof sa); sa.sa_handler = on_signal; sa.sa_flags = SA_NODEFER;
++    sigaction(SIGSEGV, &sa, NULL); sigaction(SIGILL, &sa, NULL); sigaction(SIGBUS, &sa, NULL); sigaction(SIGFPE, &sa, NULL);
++
++    enum { BUF = 0x100000, MID = 0x80000, WIN_PRE = 64, WIN = 256 };
++    uint8_t *buf = aligned_alloc(4096, BUF);
++    fill(buf, BUF);
++    uint8_t *exec = mmap(NULL, 8192, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++
++    typedef struct { uint8_t code[16]; int n; Dec d; int need_mem; } Item;
++    Item *items = malloc(sizeof(Item) * 200000);
++    long nitems = 0;
++    long tested = 0, passed = 0, failed = 0, unsupported = 0, skipped = 0, native_fault = 0, samples = 0, mxdiff = 0;
++    char line[256];
++    int shown = 0;
++    while (fgets(line, sizeof line, f)) {
++        uint8_t code[24] = {0};
++        int n = 0;
++        for (char *q = line; *q && *q != '\n' && n < 15; q += 2) { unsigned v; if (sscanf(q, "%2x", &v) != 1) break; code[n++] = (uint8_t)v; }
++        if (!n) continue;
++        ++samples;
++        /* decode just enough to place memory operands */
++        Dec d; Op o; memset(&d, 0, sizeof d);
++        char why[160] = "";
++        int is_vex = code[0] == 0xC4 || code[0] == 0xC5;
++        int need_mem = 0;
++        if (is_vex) {
++            int rr, xx = 0, bb = 0, i;
++            if (code[0] == 0xC5) { rr = !(code[1] & 0x80); d.vvvv = (~code[1] >> 3) & 15; d.L = (code[1] >> 2) & 1; d.pp = code[1] & 3; d.map = 1; i = 2; }
++            else { rr = !(code[1] & 0x80); xx = !(code[1] & 0x40); bb = !(code[1] & 0x20); d.map = code[1] & 31; d.W = code[2] >> 7; d.vvvv = (~code[2] >> 3) & 15; d.L = (code[2] >> 2) & 1; d.pp = code[2] & 3; i = 3; }
++            d.opc = code[i++];
++            if (!find_op(&d, &o)) { snprintf(why, sizeof why, "AVX: opcode not in table: map%d op%02x pp%d L%d", d.map, d.opc, d.pp, d.L); note(why); ++unsupported; continue; }
++            if (o.fl & F_ZERO) { need_mem = 0; }
++            else { decode_modrm(code, &i, &d, rr, xx, bb); need_mem = d.is_mem; if (o.fl & F_IMM) ++i; d.len = i; }
++        } else {                                   /* legacy: [66/F2/F3] [REX] 0F [38] op modrm */
++            int i = 0, rr = 0, xx = 0, bb = 0;
++            while (code[i] == 0x66 || code[i] == 0xF2 || code[i] == 0xF3) ++i;
++            if ((code[i] & 0xF0) == 0x40) { rr = (code[i] >> 2) & 1; xx = (code[i] >> 1) & 1; bb = code[i] & 1; ++i; }
++            if (code[i++] != 0x0F) { ++skipped; continue; }
++            int map3 = code[i] == 0x3A;
++            if (code[i] == 0x38 || code[i] == 0x3A) ++i;
++            ++i;
++            decode_modrm(code, &i, &d, rr, xx, bb);
++            if (map3) ++i;
++            need_mem = d.is_mem; d.len = i;
++            is_vex = 0;
++        }
++        if (need_mem) {
++            if (d.ripr == 0 && ((!d.has_base && !d.has_index) || (d.has_base && d.base == 4) || (d.has_base && d.has_index && d.base == d.index))) { ++skipped; continue; }
++            if (llabs(d.disp) > 0x70000) { ++skipped; continue; }
++        }
++        int strop = is_vex ? (o.id == S_PCMPSTR) : 0;
++        if (!is_vex) for (int k = 0; k + 2 < n; ++k) if (code[k] == 0x0F && code[k + 1] == 0x3A && code[k + 2] >= 0x60 && code[k + 2] <= 0x63) strop = 1;
++        uint8_t *at = exec;
++        int ripmap = 0;
++        if (d.ripr) {
++            uint64_t target = (uint64_t)(uintptr_t)(buf + MID);
++            uint64_t P = target - (uint64_t)d.len - (uint64_t)d.disp;
++            void *page = mmap((void *)(uintptr_t)(P & ~0xFFFull), 8192, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
++            if (page == MAP_FAILED || (uint64_t)(uintptr_t)page != (P & ~0xFFFull)) { if (page != MAP_FAILED) munmap(page, 8192); ++skipped; continue; }
++            at = (uint8_t *)(uintptr_t)P; ripmap = 1;
++        }
++        memcpy(at, code, (size_t)n);
++        at[n] = 0xC3;
++        /* the native run executes the instruction then returns: place a ret right after it */
++        const long passed_before = passed;
++        for (int r = 0; r < rounds; ++r) {
++            NState ns; memset(&ns, 0, sizeof ns);
++            AvxState es; memset(&es, 0, sizeof es);
++            for (int g = 0; g < 16; ++g) ns.gpr[g] = rnd() & 1 ? rnd() : rnd() & 0xFFFF;
++            if (need_mem && !d.ripr) {
++                if (d.has_base) ns.gpr[d.base] = (uint64_t)(uintptr_t)(buf + MID);
++                if (d.has_index) ns.gpr[d.index] = 3;
++            }
++            for (int y = 0; y < 16; ++y) fill(ns.ymm[y], 32);
++            ns.flags = 0x202 | (rnd() & 0x8D5); ns.mxcsr = 0x1F80;
++            if (!is_vex || !need_mem) {}
++            uint64_t ea = 0;
++            if (need_mem) { AvxState tmp; memset(&tmp, 0, sizeof tmp); memcpy(tmp.gpr, ns.gpr, sizeof tmp.gpr); ea = effective_address(&tmp, &d, at); }
++            uint8_t *win = (uint8_t *)(uintptr_t)ea - WIN_PRE;
++            if (!need_mem) win = buf + MID;
++            fill(win, WIN);
++            if (strop) {
++                for (int g = 0; g < 16; ++g) if (g == 0 || g == 2) { int64_t v = (int64_t)(rnd() % 24) - 4; if (!(need_mem && !d.ripr && ((d.has_base && d.base == g) || (d.has_index && d.index == g)))) ns.gpr[g] = (uint64_t)v; }
++                const uint8_t alpha = (rnd() & 1) ? 3 : 7;
++                for (int y = 0; y < 16; ++y) for (int b = 0; b < 32; ++b) ns.ymm[y][b] = (uint8_t)((rnd() % 5 == 0) ? 0 : (rnd() & alpha));
++                for (int b = 0; b < WIN; ++b) win[b] = (uint8_t)((rnd() % 5 == 0) ? 0 : (rnd() & alpha));
++            }
++            uint8_t w0[WIN], wn[WIN], we[WIN];
++            memcpy(w0, win, WIN);
++            /* emulator state mirrors the native one */
++            memcpy(es.gpr, ns.gpr, sizeof es.gpr);
++            for (int y = 0; y < 16; ++y) { memcpy(es.xmm[y], ns.ymm[y], 16); memcpy(es.ymmh[y], ns.ymm[y] + 16, 16); }
++            es.rflags = ns.flags; es.mxcsr = ns.mxcsr;
++            AvxState e0 = es;
++            int len = avx_emulate(&es, at, why, sizeof why);
++            if (!len) { note(why); ++unsupported; break; }
++            memcpy(we, win, WIN);
++            memcpy(win, w0, WIN);
++            NState ns0 = ns;
++            if (sigsetjmp(trap, 1)) { ++native_fault; if (native_fault <= 12) { printf("NATIVE-FAULT "); for (int k = 0; k < n; ++k) printf("%02x", code[k]); printf(" ea=%llx\n", (unsigned long long)ea); } break; }
++            native_run(&ns, at);
++            memcpy(wn, win, WIN);
++            ++tested;
++            int bad = 0; char detail[200] = "";
++            for (int g = 0; g < 16 && !bad; ++g) if (g != 4 && ns.gpr[g] != es.gpr[g]) { bad = 1; snprintf(detail, sizeof detail, "gpr%d native=%016llx emu=%016llx", g, (unsigned long long)ns.gpr[g], (unsigned long long)es.gpr[g]); }
++            for (int y = 0; y < 16 && !bad; ++y) {
++                if (memcmp(ns.ymm[y], es.xmm[y], 16)) { bad = 1; snprintf(detail, sizeof detail, "ymm%d low differs", y); }
++                else if (memcmp(ns.ymm[y] + 16, es.ymmh[y], 16)) { bad = 1; snprintf(detail, sizeof detail, "ymm%d high differs", y); }
++            }
++            if (!bad && memcmp(wn, we, WIN)) { bad = 1; snprintf(detail, sizeof detail, "memory differs"); }
++            int fmask = 0;
++            if (is_vex && ((o.fl & F_NODST) || o.id == S_TESTPS || o.id == S_TESTPD)) fmask = 0x8D5;
++            if (is_vex && (o.id == S_ANDN || o.id == S_BLSX)) fmask = 0x8C1;
++            if (is_vex && o.id == S_BEXTR) fmask = 0x841;
++            if (strop) fmask = 0x8D5;
++            if (!is_vex) for (int k = 0; k + 1 < n; ++k) if (code[k] == 0x0F && code[k + 1] == 0xB8) fmask = 0x8D5;
++            if (!bad && fmask && ((ns.flags ^ es.rflags) & fmask)) { bad = 1; snprintf(detail, sizeof detail, "flags native=%llx emu=%llx", (unsigned long long)(ns.flags & fmask), (unsigned long long)(es.rflags & fmask)); }
++            if (!bad && ((ns.mxcsr ^ es.mxcsr) & 0x3F)) ++mxdiff;
++            (void)e0; (void)ns0;
++            if (bad) {
++                ++failed;
++                if (shown < 40) { ++shown; printf("MISMATCH "); for (int k = 0; k < n; ++k) printf("%02x", code[k]); printf(" : %s\n", detail); }
++                break;
++            }
++            ++passed;
++        }
++        if (passed - passed_before == rounds && is_vex && !d.ripr && nitems < 200000) {
++            Item *it = &items[nitems++];
++            memcpy(it->code, code, (size_t)n); it->n = n; it->d = d; it->need_mem = need_mem;
++        }
++        if (ripmap) munmap((void *)(uintptr_t)((uint64_t)(uintptr_t)at & ~0xFFFull), 8192);
++    }
++
++    /* Sequence test: random straight runs of the instructions that passed alone, run natively and
++     * through avx_emulate_run, which must consume the whole run in one call. */
++    long seq_tested = 0, seq_passed = 0, seq_failed = 0, seq_skipped = 0, seq_short = 0;
++    const int seq_count = argc > 3 ? atoi(argv[3]) : 20000;
++    for (int q = 0; q < seq_count && nitems > 1; ++q) {
++        int k = 2 + (int)(rnd() % 7);
++        Item *pick[8];
++        int role[16] = {0}, bad_roles = 0;
++        for (int i = 0; i < k && !bad_roles; ++i) {
++            pick[i] = &items[rnd() % (uint64_t)nitems];
++            const Dec *dd = &pick[i]->d;
++            if (!pick[i]->need_mem) continue;
++            if (dd->has_base) { if (role[dd->base] == 2) bad_roles = 1; role[dd->base] = 1; }
++            if (dd->has_index) { if (role[dd->index] == 1) bad_roles = 1; role[dd->index] = 2; }
++            if (dd->has_base && dd->has_index && dd->base == dd->index) bad_roles = 1;
++        }
++        if (bad_roles) { ++seq_skipped; continue; }
++        uint8_t seq[256]; int total = 0;
++        for (int i = 0; i < k; ++i) { memcpy(seq + total, pick[i]->code, (size_t)pick[i]->n); total += pick[i]->n; }
++        seq[total] = 0xC3;
++        memcpy(exec, seq, (size_t)total + 1);
++        NState ns; memset(&ns, 0, sizeof ns);
++        for (int g = 0; g < 16; ++g) ns.gpr[g] = role[g] == 1 ? (uint64_t)(uintptr_t)(buf + MID) : role[g] == 2 ? 3 : (rnd() & 1 ? rnd() : rnd() & 0xFFFF);
++        for (int y = 0; y < 16; ++y) fill(ns.ymm[y], 32);
++        ns.flags = 0x202 | (rnd() & 0x8D5); ns.mxcsr = 0x1F80;
++        AvxState es; memset(&es, 0, sizeof es);
++        memcpy(es.gpr, ns.gpr, sizeof es.gpr);
++        for (int y = 0; y < 16; ++y) { memcpy(es.xmm[y], ns.ymm[y], 16); memcpy(es.ymmh[y], ns.ymm[y] + 16, 16); }
++        es.rflags = ns.flags; es.mxcsr = ns.mxcsr;
++        /* memory span the run can touch */
++        uint64_t lo = ~0ull, hi = 0;
++        for (int i = 0; i < k; ++i) if (pick[i]->need_mem) {
++            uint64_t ea = effective_address(&es, &pick[i]->d, exec);
++            if (ea < lo) lo = ea;
++            if (ea + 32 > hi) hi = ea + 32;
++        }
++        if (lo == ~0ull) { lo = (uint64_t)(uintptr_t)(buf + MID); hi = lo + 32; }
++        lo -= 64; hi += 64;
++        if (hi - lo > 8192) { ++seq_skipped; continue; }
++        uint8_t m0[8192], mn[8192], me[8192];
++        const size_t span = (size_t)(hi - lo);
++        fill((uint8_t *)(uintptr_t)lo, span & ~7ull);
++        memcpy(m0, (void *)(uintptr_t)lo, span);
++        char why[160] = "";
++        int cnt = 0;
++        int used = avx_emulate_run(&es, exec, 256, &cnt, why, sizeof why);
++        memcpy(me, (void *)(uintptr_t)lo, span);
++        memcpy((void *)(uintptr_t)lo, m0, span);
++        if (used != total || cnt != k) { ++seq_short; if (seq_short <= 5) { printf("SEQ-SHORT used %d of %d, %d of %d insns: ", used, total, cnt, k); for (int i = 0; i < total; ++i) printf("%02x", seq[i]); printf(" %s\n", why); } continue; }
++        if (sigsetjmp(trap, 1)) { ++seq_skipped; continue; }
++        native_run(&ns, exec);
++        memcpy(mn, (void *)(uintptr_t)lo, span);
++        ++seq_tested;
++        int bad = 0;
++        for (int g = 0; g < 16 && !bad; ++g) if (g != 4 && ns.gpr[g] != es.gpr[g]) bad = 1;
++        for (int y = 0; y < 16 && !bad; ++y) if (memcmp(ns.ymm[y], es.xmm[y], 16) || memcmp(ns.ymm[y] + 16, es.ymmh[y], 16)) bad = 1;
++        if (!bad && memcmp(mn, me, span)) bad = 1;
++        if (bad) { ++seq_failed; if (seq_failed <= 10) { printf("SEQ-MISMATCH "); for (int i = 0; i < total; ++i) printf("%02x", seq[i]); printf("\n"); } }
++        else ++seq_passed;
++    }
++    printf("sequences: tested %ld  passed %ld  failed %ld  short %ld  skipped %ld\n", seq_tested, seq_passed, seq_failed, seq_short, seq_skipped);
++    failed += seq_failed;
++    printf("samples %ld  tested-rounds %ld  passed %ld  failed %ld  unsupported %ld  skipped %ld  native-fault %ld  mxcsr-flag-diffs %ld\n",
++           samples, tested, passed, failed, unsupported, skipped, native_fault, mxdiff);
++    for (int i = 0; i < nreasons; ++i) printf("  %5d x %s\n", reasons[i].n, reasons[i].text);
++    return failed ? 1 : 0;
++}
