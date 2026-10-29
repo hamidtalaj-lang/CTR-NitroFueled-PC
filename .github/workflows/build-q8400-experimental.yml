@@ -1,4 +1,4 @@
-name: Build CTR Q8400 experimental (Windows, clean FSR checkout)
+name: Build CTR Q8400 experimental (Windows)
 
 on:
   workflow_dispatch:
@@ -9,38 +9,11 @@ permissions:
 jobs:
   build-windows:
     runs-on: windows-latest
-    env:
-      GIT_CONFIG_COUNT: 1
-      GIT_CONFIG_KEY_0: core.longpaths
-      GIT_CONFIG_VALUE_0: "true"
-
     steps:
-      - name: Checkout fork containing source archive and patch
+      - name: Checkout repository and submodules
         uses: actions/checkout@v4
         with:
-          path: input
-
-      - name: Verify files and extract source archive
-        shell: pwsh
-        run: |
-          $archive = "input/CTR-NitroFueled-PC-0.4.zip"
-          $patch = "input/CTR_Q8400_AVX_emulation_experimental.patch"
-
-          if (!(Test-Path $archive)) {
-            throw "Missing $archive. Put the source ZIP in the repository root."
-          }
-          if (!(Test-Path $patch)) {
-            throw "Missing $patch. Put the experimental patch in the repository root."
-          }
-
-          Expand-Archive -LiteralPath $archive -DestinationPath source-unpacked -Force
-          $root = Get-ChildItem source-unpacked -Directory | Select-Object -First 1
-          if (!$root -or !(Test-Path (Join-Path $root.FullName "build.sh"))) {
-            throw "Could not locate the extracted source root or build.sh."
-          }
-
-          "SOURCE_DIR=$($root.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          Copy-Item $patch (Join-Path $root.FullName "CTR_Q8400_AVX_emulation_experimental.patch")
+          submodules: recursive
 
       - name: Set up MSYS2 CLANG64
         uses: msys2/setup-msys2@v2
@@ -70,103 +43,42 @@ jobs:
             mingw-w64-clang-x86_64-spirv-headers
             mingw-w64-clang-x86_64-spirv-cross
 
-      - name: Initialize source snapshot and apply experimental patch
+      - name: Apply experimental Q8400 patch
         shell: msys2 {0}
         run: |
-          cd "$SOURCE_DIR"
-          git init
-          git config user.email "actions@github.com"
-          git config user.name "GitHub Actions"
-          git add -A
-          git commit -m "Local source snapshot"
+          if [ ! -f CTR_Q8400_AVX_emulation_experimental.patch ]; then
+            echo "Missing CTR_Q8400_AVX_emulation_experimental.patch at repository root." >&2
+            echo "Upload the patch file to the root of your fork, then rerun this workflow." >&2
+            exit 1
+          fi
           git apply --check CTR_Q8400_AVX_emulation_experimental.patch
           git apply CTR_Q8400_AVX_emulation_experimental.patch
 
-      - name: Populate submodules and pin FSR-Vulkan base
-        shell: pwsh
+      - name: Pin FSR-Vulkan to the commit the port's patches expect
+        shell: msys2 {0}
         run: |
-          $root = Get-ChildItem source-unpacked -Directory | Select-Object -First 1
-          if (!$root) { throw "Extracted source directory not found." }
-
-          $modules = @(
-            @{ Path = "gpu/third_party/fsr-vulkan"; Url = "https://github.com/FireBurn/FSR-Vulkan.git" },
-            @{ Path = "gpu/third_party/imgui"; Url = "https://github.com/ocornut/imgui.git" },
-            @{ Path = "third_party/LibAtrac9"; Url = "https://github.com/Thealexbarney/LibAtrac9.git" },
-            @{ Path = "gpu/third_party/magic_enum"; Url = "https://github.com/Neargye/magic_enum.git" },
-            @{ Path = "gpu/third_party/miniz"; Url = "https://github.com/richgel999/miniz.git" },
-            @{ Path = "gpu/third_party/xbyak"; Url = "https://github.com/herumi/xbyak.git" }
-          )
-
-          git config --global core.longpaths true
-          foreach ($module in $modules) {
-            $dest = Join-Path $root.FullName $module.Path
-            if (Test-Path $dest) {
-              Remove-Item $dest -Recurse -Force
-            }
-            New-Item -ItemType Directory -Force -Path (Split-Path $dest) | Out-Null
-
-            if ($module.Path -eq "gpu/third_party/fsr-vulkan") {
-              # README says the source expects upstream FSR-Vulkan commit c64f093.
-              # Clone full history, then checkout the commit (do not fetch the short hash as a remote ref).
-              git -c core.longpaths=true clone $module.Url $dest
-              if ($LASTEXITCODE -ne 0) {
-                throw "Failed to clone full FSR-Vulkan history."
-              }
-              git -C $dest checkout --detach c64f093
-              if ($LASTEXITCODE -ne 0) {
-                throw "Could not checkout expected FSR-Vulkan commit c64f093."
-              }
-            } else {
-              git -c core.longpaths=true clone --depth 1 $module.Url $dest
-              if ($LASTEXITCODE -ne 0) {
-                throw "Failed to clone submodule $($module.Path)"
-              }
-            }
-          }
-
-      - name: Reset FSR-Vulkan to clean pinned source before build
-        shell: pwsh
-        run: |
-          $root = Get-ChildItem source-unpacked -Directory | Select-Object -First 1
-          $fsr = Join-Path $root.FullName "gpu/third_party/fsr-vulkan"
-          if (!(Test-Path (Join-Path $fsr ".git"))) { throw "FSR-Vulkan git checkout is missing." }
-          # Ensure build.sh starts from a clean upstream checkout. Do not pre-apply
-          # patches here; build.sh is responsible for applying the project's patches.
-          git -C $fsr reset --hard c64f093
-          if ($LASTEXITCODE -ne 0) { throw "Could not reset FSR-Vulkan to c64f093." }
-          git -C $fsr clean -fd
-          if ($LASTEXITCODE -ne 0) { throw "Could not clean FSR-Vulkan checkout." }
-          git -C $fsr status --short
-          git -C $fsr rev-parse --short HEAD
+          set -e
+          cd gpu/third_party/fsr-vulkan
+          git fetch --tags origin
+          git checkout -f c64f093
+          git reset --hard c64f093
+          git clean -fdx
+          blob=$(git rev-parse HEAD:src/ffx_vk_fsr4_v07.c)
+          echo "HEAD=$(git rev-parse HEAD) ffx_vk_fsr4_v07.c=$blob"
+          case "$blob" in c30f7cf*) ;; *) echo "Wrong FSR-Vulkan base: expected blob c30f7cf" >&2; exit 1;; esac
 
       - name: Build Windows binaries
         shell: msys2 {0}
-        run: |
-          export PATH="/clang64/bin:$PATH"
-          command -v cmake
-          command -v ninja
-          cmake --version
-          ninja --version
-          cd "$SOURCE_DIR"
-          set +e
-          bash build.sh 2>&1 | tee out-build.log
-          build_status=${PIPESTATUS[0]}
-          if [ -f out/gpu-build.log ]; then
-            echo "===== FULL out/gpu-build.log ====="
-            cat out/gpu-build.log
-            echo "===== END out/gpu-build.log ====="
-          fi
-          exit "$build_status"
+        run: bash build.sh
 
       - name: Upload build outputs and logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: CTR-Q8400-experimental-clean-fsr-checkout
+          name: CTR-Q8400-experimental-windows
           path: |
-            source-unpacked/**/out/*.exe
-            source-unpacked/**/out/VERSION
-            source-unpacked/**/out/gpu-build.log
-            source-unpacked/**/out-build.log
+            out/*.exe
+            out/VERSION
+            out/gpu-build.log
           if-no-files-found: warn
           retention-days: 7
