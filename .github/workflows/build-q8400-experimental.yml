@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       upstream_ref:
-        description: "Upstream tag/branch/commit of GetLostIn/CTR-NitroFueled-PC to build (v0.4)"
+        description: "Upstream ref used only for submodule pins"
         default: "v0.4"
         required: true
 
@@ -15,24 +15,38 @@ jobs:
   build-windows:
     runs-on: windows-latest
     steps:
-      - name: Checkout fork (workflow and avx-emulation.patch)
+      - name: Checkout fork (workflow, source zip and avx-emulation.patch)
         uses: actions/checkout@v4
         with:
           path: input
 
-      - name: Checkout upstream source with pinned submodules
+      - name: Checkout upstream only to get the pinned submodules
         uses: actions/checkout@v4
         with:
           repository: GetLostIn/CTR-NitroFueled-PC
           ref: ${{ inputs.upstream_ref }}
           submodules: recursive
-          path: source
+          path: upstream
 
-      - name: Verify patch file
+      - name: Extract the 0.4 zip, fill its submodule folders, copy patch
         shell: pwsh
         run: |
+          $archive = Get-ChildItem input -Filter "CTR-NitroFueled-PC-0*.zip" | Select-Object -First 1
+          if (!$archive) { throw "Missing CTR-NitroFueled-PC-0.4.zip in the root of your fork." }
           if (!(Test-Path input/avx-emulation.patch)) { throw "Missing avx-emulation.patch in the root of your fork." }
-          Copy-Item input/avx-emulation.patch source/avx-emulation.patch
+          Expand-Archive -LiteralPath $archive.FullName -DestinationPath source-unpacked -Force
+          $root = Get-ChildItem source-unpacked -Directory | Select-Object -First 1
+          if (!$root -or !(Test-Path (Join-Path $root.FullName "build.sh"))) { throw "Could not locate extracted source root/build.sh." }
+          foreach ($d in @("gpu/third_party/fsr-vulkan","gpu/third_party/imgui","gpu/third_party/magic_enum","gpu/third_party/miniz","gpu/third_party/xbyak","third_party/LibAtrac9")) {
+            $src = Join-Path (Resolve-Path upstream).Path $d
+            $dst = Join-Path $root.FullName $d
+            New-Item -ItemType Directory -Force -Path $dst | Out-Null
+            robocopy $src $dst /E /XD .git /XF .git /NFL /NDL /NJH /NJS | Out-Null
+            if ($LASTEXITCODE -ge 8) { throw "robocopy failed for $d" }
+            $global:LASTEXITCODE = 0
+          }
+          "SOURCE_DIR=$($root.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Copy-Item input/avx-emulation.patch (Join-Path $root.FullName "avx-emulation.patch")
 
       - name: Set up MSYS2 CLANG64
         uses: msys2/setup-msys2@v2
@@ -62,18 +76,23 @@ jobs:
             mingw-w64-clang-x86_64-spirv-headers
             mingw-w64-clang-x86_64-spirv-cross
 
-      - name: Apply AVX emulation patch
+      - name: Snapshot source and apply AVX emulation patch
         shell: msys2 {0}
         run: |
-          cd source
-          git submodule status
+          cd "$SOURCE_DIR"
+          git init -q
+          git config user.email "actions@github.com"
+          git config user.name "GitHub Actions"
+          git add -A
+          git commit -q -m "v0.4 source snapshot"
+          echo "fsr4 blob: $(git hash-object gpu/third_party/fsr-vulkan/src/ffx_vk_fsr4_v07.c) (patch expects c30f7cf)"
           git apply --check avx-emulation.patch
           git apply avx-emulation.patch
 
       - name: Build Windows binaries
         shell: msys2 {0}
         run: |
-          cd source
+          cd "$SOURCE_DIR"
           bash build.sh 2>&1 | tee out-build.log
 
       - name: Upload build outputs and logs
@@ -82,9 +101,9 @@ jobs:
         with:
           name: CTR-Q8400-experimental-windows
           path: |
-            source/out/*.exe
-            source/out/VERSION
-            source/out/gpu-build.log
-            source/out-build.log
+            source-unpacked/**/out/*.exe
+            source-unpacked/**/out/VERSION
+            source-unpacked/**/out/gpu-build.log
+            source-unpacked/**/out-build.log
           if-no-files-found: warn
           retention-days: 7
