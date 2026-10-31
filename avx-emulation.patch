@@ -22,10 +22,10 @@ index 7fdc4fa..b97b092 100644
  # "-dirty" when tracked files differ from it). run.sh prints it, the launcher shows it and the
 diff --git a/docs/avx-emulation.md b/docs/avx-emulation.md
 new file mode 100644
-index 0000000..caa7ded
+index 0000000..de98b61
 --- /dev/null
 +++ b/docs/avx-emulation.md
-@@ -0,0 +1,62 @@
+@@ -0,0 +1,56 @@
 +# AVX / SSE4.2 / POPCNT emulation (CPUs older than Sandy Bridge)
 +
 +The game code is built for the PS4's Jaguar CPU and uses AVX (128 and 256 bit), F16C, POPCNT and
@@ -66,13 +66,7 @@ index 0000000..caa7ded
 +  (shorter than 5 bytes with no plain instruction after them, or branch targets inside) stay on the
 +  fault-handler path. `BB_AVX_REWRITE=0` disables the table; the loader prints
 +  `AVX: N of M runs rewritten to stubs`. Limits: like the ISA rewrite, an indirect jump into the middle
-+  of a covered run is not detected by the scanner (only direct branch targets are). The bytes after the
-+  5-byte jmp are 0xCC; an int3 on one of them is resumed at run time (`avx_stub_resume`: the table keeps
-+  each run's original bytes and instruction boundaries, so the rest of the run is emulated from that
-+  instruction and the thread continues after the site). A jump into the middle of an instruction is
-+  not resumable. Any other int3 inside the image ends the process with a crash report (it used to end it
-+  silently with exit code 0x80000003). The int3 path costs a full exception dispatch and, on Windows, writes
-+  below rsp like any exception, so it is a safety net, not a fast path.
++  of a covered run is not detected (only direct branch targets are).
 +
 +## Tests
 +
@@ -129,10 +123,10 @@ index 195919d..43237e0 100644
          # DLC (optional): the player's add-on packages in dlc\ (BB_DLC_DIR), reported installed.
 diff --git a/scripts/avx_rewrite.py b/scripts/avx_rewrite.py
 new file mode 100644
-index 0000000..a02650b
+index 0000000..57f3f52
 --- /dev/null
 +++ b/scripts/avx_rewrite.py
-@@ -0,0 +1,134 @@
+@@ -0,0 +1,129 @@
 +#!/usr/bin/env python3
 +"""Builds out/avx-rewrite.bin (BBAVX1), the table src/avx_stub.c applies at load time.
 +
@@ -163,7 +157,7 @@ index 0000000..a02650b
 +
 +EMU_MAX, RELOC_MAX, MIN_COVER = 32, 16, 5
 +HEADER = struct.Struct('<8sQ32sI12x')     # magic, image size, sha256, sites     (64 bytes)
-+RECORD = struct.Struct('<QBBB4sx32s16s')  # offset, emu_len, n_insn, reloc_len, starts, emu, reloc (64 bytes, AvxSite)
++RECORD = struct.Struct('<QBBB5x32s16s')   # offset, emu_len, n_insn, reloc_len, emu, reloc (64 bytes, AvxSite)
 +
 +
 +@dataclass
@@ -181,7 +175,6 @@ index 0000000..a02650b
 +    emu: bytes
 +    n_insn: int
 +    reloc: bytes
-+    starts: int = 0      # bit i set: an emulated instruction starts at byte i of `emu` (a jump into the middle of the run is resumed there)
 +
 +
 +def plan(insns):
@@ -202,11 +195,7 @@ index 0000000..a02650b
 +            if nxt.plain and not nxt.target and nxt.ip == insns[j - 1].ip + len(insns[j - 1].data) and len(nxt.data) <= RELOC_MAX:
 +                reloc = nxt.data
 +        if size + len(reloc) >= MIN_COVER:
-+            starts, at = 0, 0
-+            for x in insns[i:j]:
-+                starts |= 1 << at
-+                at += len(x.data)
-+            sites.append(Site(insns[i].ip, b''.join(x.data for x in insns[i:j]), j - i, reloc, starts))
++            sites.append(Site(insns[i].ip, b''.join(x.data for x in insns[i:j]), j - i, reloc))
 +        i = max(j, i + 1)
 +    return sites
 +
@@ -214,7 +203,7 @@ index 0000000..a02650b
 +def encode_table(image, sites):
 +    table = [HEADER.pack(b'BBAVX1\0\0', len(image), hashlib.sha256(image).digest(), len(sites))]
 +    for s in sorted(sites, key=lambda s: s.offset):
-+        table.append(RECORD.pack(s.offset, len(s.emu), s.n_insn, len(s.reloc), struct.pack('<I', s.starts), s.emu, s.reloc))
++        table.append(RECORD.pack(s.offset, len(s.emu), s.n_insn, len(s.reloc), s.emu, s.reloc))
 +    return b''.join(table)
 +
 +
@@ -1380,10 +1369,10 @@ index 0000000..ec2cdc4
 +#endif
 diff --git a/src/avx_stub.c b/src/avx_stub.c
 new file mode 100644
-index 0000000..497a7c8
+index 0000000..6fe6eb2
 --- /dev/null
 +++ b/src/avx_stub.c
-@@ -0,0 +1,218 @@
+@@ -0,0 +1,187 @@
 +/* See avx_stub.h. */
 +#include "avx_stub.h"
 +#include "isa_rewrite.h"
@@ -1513,7 +1502,6 @@ index 0000000..497a7c8
 +        put64(st + n, (uint64_t)(uintptr_t)s); n += 8;
 +        st[n++] = 0xFF; st[n++] = 0x15; put32(st + n, (uint32_t)(AVX_STUB_BYTES - 8 - (n + 4))); n += 4;   /* call [rip+target] */
 +        memcpy(st + n, tail, sizeof tail); n += sizeof tail;
-+        if (n != AVX_STUB_RELOC_OFF) { ++t->skipped; memset(st, 0xCC, AVX_STUB_BYTES); continue; }   /* avx_stub_resume enters here */
 +        memcpy(st + n, s->reloc, s->reloc_len); n += s->reloc_len;
 +        int64_t back = (int64_t)((uintptr_t)(at + covered) - (uintptr_t)(st + n + 5));
 +        int64_t fwd = (int64_t)((uintptr_t)st - (uintptr_t)(at + 5));
@@ -1522,7 +1510,8 @@ index 0000000..497a7c8
 +        while (n < AVX_STUB_BYTES - 8) st[n++] = 0xCC;
 +        put64(st + AVX_STUB_BYTES - 8, (uint64_t)(uintptr_t)&bb_avx_tramp);
 +        at[0] = 0xE9; put32(at + 1, (uint32_t)(int32_t)fwd);
-+        memset(at + 5, 0xCC, covered - 5);
++        /* bytes 5.. keep their original contents: a jump into the middle of the run then executes the old instructions
++         * (they fault on this CPU and the fault handler emulates them) instead of hitting an int3 */
 +        ++done;
 +    }
 +    return done;
@@ -1534,43 +1523,12 @@ index 0000000..497a7c8
 +    return i < t->count ? (int)i : -1;
 +}
 +
-+int avx_stub_resume(const AvxTable *t, uintptr_t address, AvxState *st, uintptr_t *next_rip) {
-+    if (!t || !t->image || !t->stubs || address < (uintptr_t)t->image) return 0;
-+    uint64_t at = address - (uintptr_t)t->image;
-+    uint32_t lo = 0, hi = t->count;                       /* last site with offset <= at (the table is sorted) */
-+    while (lo < hi) {
-+        uint32_t mid = lo + (hi - lo) / 2;
-+        if (t->sites[mid].offset <= at) lo = mid + 1; else hi = mid;
++int avx_stub_site_covering(const AvxTable *t, uint64_t offset) {
++    for (uint32_t i = 0; t && i < t->count; ++i) {
++        const AvxSite *s = &t->sites[i];
++        if (offset >= s->offset && offset < s->offset + s->emu_len + s->reloc_len) return (int)i;
 +    }
-+    if (!lo) return 0;
-+    const AvxSite *s = &t->sites[lo - 1];
-+    unsigned covered = (unsigned)s->emu_len + s->reloc_len;
-+    uint64_t o = at - s->offset;
-+    unsigned char *site = t->image + s->offset;
-+    if (o < 5 || o >= covered || site[0] != 0xE9 || site[o] != 0xCC) return 0;   /* not a rewritten site's filler */
-+    uint32_t starts = (uint32_t)s->starts[0] | (uint32_t)s->starts[1] << 8 | (uint32_t)s->starts[2] << 16 | (uint32_t)s->starts[3] << 24;
-+    unsigned char *stub = t->stubs + (size_t)(s - t->sites) * AVX_STUB_BYTES;
-+    if (o < s->emu_len) {
-+        if (o >= 32 || !(starts >> o & 1)) return 0;
-+        uint8_t buf[AVX_EMU_MAX + 16];
-+        memset(buf, 0, sizeof buf);
-+        memcpy(buf, s->emu + o, s->emu_len - o);
-+        st->ip_bias = (int64_t)((uintptr_t)(site + o) - (uintptr_t)buf);
-+        unsigned off = 0;
-+        AvxState work = *st;                              /* st stays untouched when an instruction fails */
-+        while (off < s->emu_len - o) {
-+            char why[200];
-+            int len = avx_emulate(&work, buf + off, why, sizeof why);
-+            if (len <= 0) { fprintf(stderr, "AVX stub resume: %s\n", why); return 0; }
-+            off += (unsigned)len;
-+        }
-+        if (off != s->emu_len - o) return 0;
-+        *st = work;
-+    } else if (o != s->emu_len) {
-+        return 0;                                         /* inside the relocated instruction: no boundary known */
-+    }
-+    *next_rip = s->reloc_len ? (uintptr_t)(stub + AVX_STUB_RELOC_OFF) : (uintptr_t)(site + covered);
-+    return 1;
++    return -1;
 +}
 +
 +static IsaTable *unused_guard;   /* keeps isa_rewrite.h in the include set for isa_sha256 */
@@ -1604,10 +1562,10 @@ index 0000000..497a7c8
 +}
 diff --git a/src/avx_stub.h b/src/avx_stub.h
 new file mode 100644
-index 0000000..2bd3a87
+index 0000000..9c51ae8
 --- /dev/null
 +++ b/src/avx_stub.h
-@@ -0,0 +1,72 @@
+@@ -0,0 +1,68 @@
 +/* Load-time rewrite of AVX / POPCNT / SSE4.2 sites into stubs (red-zone safe).
 + *
 + * Why: on Windows the exception dispatcher writes CONTEXT below rsp *before* any handler runs,
@@ -1633,8 +1591,7 @@ index 0000000..2bd3a87
 +    uint8_t emu_len;       /* bytes of the instructions to emulate */
 +    uint8_t n_insn;        /* how many instructions that is */
 +    uint8_t reloc_len;     /* 0, or the length of a plain instruction run natively after them */
-+    uint8_t starts[4];     /* little-endian bit mask: bit i = an instruction starts at emu[i] */
-+    uint8_t reserved;
++    uint8_t reserved[5];
 +    uint8_t emu[AVX_EMU_MAX];      /* their original bytes */
 +    uint8_t reloc[AVX_RELOC_MAX];  /* the relocated instruction's original bytes */
 +} AvxSite;                 /* covered = emu_len + reloc_len >= 5 */
@@ -1648,7 +1605,7 @@ index 0000000..2bd3a87
 +    uint64_t skipped;
 +} AvxTable;
 +
-+enum { AVX_STUB_BYTES = 64, AVX_STUB_RELOC_OFF = 33 };   /* lea, push, mov, call, lea, relocated insn, jmp, 8-byte target */
++enum { AVX_STUB_BYTES = 64 };   /* lea, push, mov, call, lea, relocated insn, jmp, 8-byte target */
 +
 +/* Frame the trampoline builds; the dispatcher reads and writes it. */
 +typedef struct {
@@ -1671,13 +1628,10 @@ index 0000000..2bd3a87
 +
 +AvxTable *avx_table_load(const char *path);          /* NULL and one stderr line when invalid */
 +int avx_table_matches(const AvxTable *t, const unsigned char *image, uint64_t size);  /* 0 = match */
-+/* A jump into the middle of a rewritten run lands on one of its 0xCC filler bytes. If `address` (the int3)
-+ * is an instruction boundary of such a site, emulates the rest of the run on `st` (ip_bias is set here),
-+ * stores where the thread continues in *next_rip (the stub's copy of the relocated instruction, or the code after
-+ * the site) and returns 1. 0 when `address` is not a resumable filler byte (st untouched). */
-+int avx_stub_resume(const AvxTable *t, uintptr_t address, AvxState *st, uintptr_t *next_rip);
 +/* Index of the site whose stub holds rip, or -1 (for fault reports). */
 +int avx_stub_site_of(const AvxTable *t, uintptr_t rip);
++/* Index of the site whose covered bytes contain image offset `offset`, or -1 (slow: only for fault reports). */
++int avx_stub_site_covering(const AvxTable *t, uint64_t offset);
 +
 +#endif
 diff --git a/src/isa_rewrite.c b/src/isa_rewrite.c
@@ -1706,7 +1660,7 @@ index 3cff4bb..eb077e3 100644
  unsigned isa_site_set(const IsaSite *s);                 /* CPU_SET_* of the kind */
  /* Rewrites the sites whose set is in `sets` (spec 5.4). Writes nothing and returns
 diff --git a/src/probe.c b/src/probe.c
-index f8f9c5e..c0de21e 100644
+index f8f9c5e..ca861d2 100644
 --- a/src/probe.c
 +++ b/src/probe.c
 @@ -9,6 +9,8 @@
@@ -1814,7 +1768,7 @@ index f8f9c5e..c0de21e 100644
      return 1;
  }
  static uint64_t read64(FILE *f) {
-@@ -164,8 +238,11 @@ static void describe_address(char *out, size_t size, uintptr_t address) {
+@@ -164,8 +238,15 @@ static void describe_address(char *out, size_t size, uintptr_t address) {
      HMODULE module=NULL;
      char name[MAX_PATH]="?";
      int site=isa_table ? isa_rewrite_site_of_stub(isa_table,address) : -1;
@@ -1824,10 +1778,14 @@ index f8f9c5e..c0de21e 100644
          int n=snprintf(out,size,"guest offset 0x%" PRIxPTR,address-(uintptr_t)image);
 +        if (avx_site>=0 && n>=0 && (size_t)n<size)
 +            snprintf(out+n,size-n," While emulating AVX stub site 0x%" PRIx64,avx_table->sites[avx_site].offset);
++        else if (avx_table && image && address-(uintptr_t)image<0x20000000 && n>=0 && (size_t)n<size) {
++            int covering=avx_stub_site_covering(avx_table,address-(uintptr_t)image);
++            if (covering>=0) snprintf(out+n,size-n," Inside the AVX-rewritten run at 0x%" PRIx64,avx_table->sites[covering].offset);
++        }
          if (site>=0 && n>=0 && (size_t)n<size)
              snprintf(out+n,size-n," While emulating site 0x%" PRIx64 " (%s)",isa_table->sites[site].offset,isa_kind_name(isa_table->sites[site].kind));
          return;
-@@ -185,6 +262,61 @@ static void isa_context_regs(CONTEXT *c, IsaRegs *regs, int to_context) {
+@@ -185,6 +266,34 @@ static void isa_context_regs(CONTEXT *c, IsaRegs *regs, int to_context) {
      for (int i=0;i<16;++i) { if (to_context) *g[i]=regs->gpr[i]; else regs->gpr[i]=*g[i]; }
      if (to_context) c->EFlags=(DWORD)regs->rflags; else regs->rflags=c->EFlags;
  }
@@ -1859,37 +1817,10 @@ index f8f9c5e..c0de21e 100644
 +    avx_count(count);
 +    return 1;
 +}
-+/* An int3 on a 0xCC filler byte inside a rewritten AVX run (something jumped into the middle of it): resumes the run
-+ * from that instruction using the table's copy of the original bytes (avx_stub_resume). */
-+static int avx_breakpoint_context(CONTEXT *c, uintptr_t address) {
-+    if (!avx_table) return 0;
-+    AvxThread *t = avx_thread();
-+    if (!t) return 0;
-+    AvxState st;
-+    IsaRegs regs;
-+    isa_context_regs(c, &regs, 0);
-+    memcpy(st.gpr, regs.gpr, sizeof st.gpr);
-+    st.rflags = regs.rflags;
-+    for (int i = 0; i < 16; ++i) memcpy(st.xmm[i], &c->FltSave.XmmRegisters[i], 16);
-+    memcpy(st.ymmh, t->ymmh, sizeof st.ymmh);
-+    st.mxcsr = c->MxCsr;
-+    st.ip_bias = 0;
-+    uintptr_t next;
-+    if (!avx_stub_resume(avx_table, address, &st, &next)) return 0;
-+    memcpy(regs.gpr, st.gpr, sizeof st.gpr);
-+    regs.rflags = st.rflags;
-+    isa_context_regs(c, &regs, 1);
-+    for (int i = 0; i < 16; ++i) memcpy(&c->FltSave.XmmRegisters[i], st.xmm[i], 16);
-+    memcpy(t->ymmh, st.ymmh, sizeof st.ymmh);
-+    c->MxCsr = st.mxcsr;
-+    c->Rip = (DWORD64)next;
-+    avx_count(1);
-+    return 1;
-+}
  const char *runtime_thread_current_name(void);
  static int fatal_reported;
  static LONG fatal_exception(EXCEPTION_POINTERS *info) {
-@@ -193,6 +325,27 @@ static LONG fatal_exception(EXCEPTION_POINTERS *info) {
+@@ -193,6 +302,27 @@ static LONG fatal_exception(EXCEPTION_POINTERS *info) {
      const CONTEXT *c=info->ContextRecord;
      char where[MAX_PATH+64];
      describe_address(where,sizeof(where),(uintptr_t)c->Rip);
@@ -1917,7 +1848,31 @@ index f8f9c5e..c0de21e 100644
      if (record->ExceptionCode==EXCEPTION_ACCESS_VIOLATION && record->NumberParameters>=2)
          fprintf(stderr,"Fault: %s access to %p at %s (thread %lu)\n",
                  record->ExceptionInformation[0]==1 ? "write" : record->ExceptionInformation[0]==8 ? "execute" : "read",
-@@ -265,6 +418,11 @@ static LONG fatal_exception(EXCEPTION_POINTERS *info) {
+@@ -262,9 +392,35 @@ static LONG fatal_exception(EXCEPTION_POINTERS *info) {
+     TerminateProcess(GetCurrentProcess(),3);
+     return EXCEPTION_CONTINUE_SEARCH;
+ }
++/* A breakpoint outside the guest image and this executable (a system DLL, a driver) used to end the process with
++ * code 0x80000003 and no report. Say where it was raised and which guest code called into it. */
++static void report_foreign_breakpoint(const EXCEPTION_POINTERS *info) {
++    const CONTEXT *c=info->ContextRecord;
++    char where[MAX_PATH+64];
++    describe_address(where,sizeof(where),(uintptr_t)c->Rip);
++    fprintf(stderr,"Unhandled breakpoint (int3) at %p: %s (thread %lu)\n",(void *)(uintptr_t)c->Rip,where,(unsigned long)GetCurrentThreadId());
++    MEMORY_BASIC_INFORMATION mbi;
++    const uintptr_t *sp=(const uintptr_t *)(uintptr_t)c->Rsp;
++    if (VirtualQuery(sp,&mbi,sizeof mbi)) {
++        const uintptr_t end=(uintptr_t)mbi.BaseAddress+mbi.RegionSize;
++        int found=0;
++        for (int i=0; i<2048 && found<8 && (uintptr_t)(sp+1)<=end; ++i,++sp) {
++            if (image && *sp-(uintptr_t)image<image_size) {
++                fprintf(stderr,"  stack holds guest address, offset 0x%" PRIxPTR "\n",*sp-(uintptr_t)image);
++                ++found;
++            }
++        }
++    }
++    fflush(stderr);
++}
  static LONG CALLBACK vectored_fault(EXCEPTION_POINTERS *info) {
      const EXCEPTION_RECORD *record=info->ExceptionRecord;
      DWORD code=record->ExceptionCode;
@@ -1929,19 +1884,24 @@ index f8f9c5e..c0de21e 100644
      if (code==EXCEPTION_BREAKPOINT && isa_table) {
          /* An int3 ISA site: emulated here; any other breakpoint goes on to the report below. */
          IsaRegs regs;
-@@ -276,6 +434,11 @@ static LONG CALLBACK vectored_fault(EXCEPTION_POINTERS *info) {
+@@ -292,7 +448,7 @@ static LONG CALLBACK vectored_fault(EXCEPTION_POINTERS *info) {
              return EXCEPTION_CONTINUE_EXECUTION;
          }
      }
-+    if (code==EXCEPTION_BREAKPOINT && avx_breakpoint_context(info->ContextRecord,(uintptr_t)record->ExceptionAddress)) return EXCEPTION_CONTINUE_EXECUTION;
-+    if (code==EXCEPTION_BREAKPOINT && image && (uintptr_t)record->ExceptionAddress-(uintptr_t)image<0x20000000) {
-+        /* An int3 nobody handled in guest code or a stub: without this the process just ends with 0x80000003 and no report. */
-+        return fatal_exception(info);
-+    }
-     if (code==EXCEPTION_ACCESS_VIOLATION && record->NumberParameters>=2) {
-         /* GPU page tracking (write-protected guest pages) is resolved first. */
-         if (gpu_enabled && bbgpu_handle_fault(info,(void *)record->ExceptionInformation[1])) return EXCEPTION_CONTINUE_EXECUTION;
-@@ -328,7 +491,58 @@ static uint64_t patch_tcb_loads(const Segment *segments, uint64_t count) {
+-    if (code==EXCEPTION_ACCESS_VIOLATION || code==EXCEPTION_ILLEGAL_INSTRUCTION || code==EXCEPTION_PRIV_INSTRUCTION ||
++    if (code==EXCEPTION_ACCESS_VIOLATION || code==EXCEPTION_ILLEGAL_INSTRUCTION || code==EXCEPTION_PRIV_INSTRUCTION || code==EXCEPTION_BREAKPOINT ||
+         code==EXCEPTION_STACK_OVERFLOW || code==EXCEPTION_INT_DIVIDE_BY_ZERO || code==EXCEPTION_DATATYPE_MISALIGNMENT) {
+         /* Faults in guest code, the loader or the runtime end the process with a report; drivers
+          * and system libraries may handle their own exceptions. */
+@@ -302,6 +458,7 @@ static LONG CALLBACK vectored_fault(EXCEPTION_POINTERS *info) {
+                  (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,(LPCSTR)rip,&module) && module==self) ||
+                  !module;
+         if (ours) return fatal_exception(info);
++        if (code==EXCEPTION_BREAKPOINT) report_foreign_breakpoint(info);
+     }
+     /* BB_STRICT_HANDLES=1: a closed or invalid handle used anywhere is reported (diagnostics). */
+     if (code==0xC0000008 /* STATUS_INVALID_HANDLE */) return fatal_exception(info);
+@@ -328,7 +485,34 @@ static uint64_t patch_tcb_loads(const Segment *segments, uint64_t count) {
  /* ucontext gregs of IsaRegs.gpr (x86 numbering). */
  static const int isa_gregs[16]={REG_RAX,REG_RCX,REG_RDX,REG_RBX,REG_RSP,REG_RBP,REG_RSI,REG_RDI,
                                  REG_R8,REG_R9,REG_R10,REG_R11,REG_R12,REG_R13,REG_R14,REG_R15};
@@ -1971,44 +1931,12 @@ index f8f9c5e..c0de21e 100644
 +    avx_count(count);
 +    return 1;
 +}
-+static int avx_trap_ucontext(ucontext_t *uc, uintptr_t address) {
-+    if (!avx_table) return 0;
-+    AvxThread *t = avx_thread();
-+    if (!t || !uc->uc_mcontext.fpregs) return 0;
-+    greg_t *g = uc->uc_mcontext.gregs;
-+    struct _libc_fpstate *fp = uc->uc_mcontext.fpregs;
-+    AvxState st;
-+    for (int i = 0; i < 16; ++i) st.gpr[i] = (uint64_t)g[isa_gregs[i]];
-+    st.rflags = (uint64_t)g[REG_EFL];
-+    for (int i = 0; i < 16; ++i) memcpy(st.xmm[i], fp->_xmm[i].element, 16);
-+    memcpy(st.ymmh, t->ymmh, sizeof st.ymmh);
-+    st.mxcsr = fp->mxcsr;
-+    st.ip_bias = 0;
-+    uintptr_t next;
-+    if (!avx_stub_resume(avx_table, address, &st, &next)) return 0;
-+    for (int i = 0; i < 16; ++i) g[isa_gregs[i]] = (greg_t)st.gpr[i];
-+    g[REG_EFL] = (greg_t)st.rflags;
-+    for (int i = 0; i < 16; ++i) memcpy(fp->_xmm[i].element, st.xmm[i], 16);
-+    memcpy(t->ymmh, st.ymmh, sizeof st.ymmh);
-+    fp->mxcsr = st.mxcsr;
-+    g[REG_RIP] = (greg_t)next;
-+    avx_count(1);
-+    return 1;
-+}
  static void fault(int sig, siginfo_t *info, void *context) {
 +    if (sig == SIGILL && avx_emulation && avx_handle_ucontext((ucontext_t *)context)) return;
      if (sig == SIGTRAP && isa_table) {
          /* An int3 ISA site (RIP is past the CC byte); any other trap ends in the report below. */
          greg_t *g = ((ucontext_t *)context)->uc_mcontext.gregs;
-@@ -343,6 +557,7 @@ static void fault(int sig, siginfo_t *info, void *context) {
-             return;
-         }
-     }
-+    if (sig == SIGTRAP && avx_trap_ucontext((ucontext_t *)context, (uintptr_t)((ucontext_t *)context)->uc_mcontext.gregs[REG_RIP] - 1)) return;
-     /* GPU page tracking (write-protected guest pages) is resolved first. */
-     if (gpu_enabled && sig == SIGSEGV && bbgpu_handle_fault(context, info->si_addr)) return;
-     /* A speculative guest memory read (runtime_memory.c) failed: resume its recovery point. */
-@@ -591,7 +806,7 @@ int main(int argc, char **argv) {
+@@ -591,7 +775,7 @@ int main(int argc, char **argv) {
  #endif
      int cpu_only = 0, strict_imports = 0, list_imports = 0;
      unsigned timeout_seconds = 10;
@@ -2017,7 +1945,7 @@ index f8f9c5e..c0de21e 100644
      for (int i = 2; i < argc; ++i) {
          if (!strcmp(argv[i], "--cpu-only")) cpu_only = 1;
          else if (!strcmp(argv[i], "--strict-imports")) strict_imports = 1;
-@@ -603,6 +818,7 @@ int main(int argc, char **argv) {
+@@ -603,6 +787,7 @@ int main(int argc, char **argv) {
          else if (!strcmp(argv[i], "--user") && i+1<argc) user_dir=argv[++i];
          else if (!strcmp(argv[i], "--patches") && i+1<argc) patch_file=argv[++i];
          else if (!strcmp(argv[i], "--isa-rewrite") && i+1<argc) isa_file=argv[++i];
@@ -2025,7 +1953,7 @@ index f8f9c5e..c0de21e 100644
          else if (!strcmp(argv[i], "--timeout") && i+1<argc) timeout_seconds=(unsigned)strtoul(argv[++i],NULL,10);
          else { fprintf(stderr, "Unknown option: %s\n", argv[i]); return 1; }
      }
-@@ -615,6 +831,7 @@ int main(int argc, char **argv) {
+@@ -615,6 +800,7 @@ int main(int argc, char **argv) {
      /* BB_ISA_REWRITE=0 never rewrites, =1 rewrites every site; by default the sets the CPU lacks. */
      const char *policy = getenv("BB_ISA_REWRITE");
      unsigned isa_sets = policy && !strcmp(policy, "1") ? 0xffffffffu : policy && !strcmp(policy, "0") ? 0 : cpu_missing_sets;
@@ -2033,7 +1961,7 @@ index f8f9c5e..c0de21e 100644
      if (cpu_missing_sets && !isa_sets) {
          printf("STOP: this CPU lacks %s and the rewrite is disabled (BB_ISA_REWRITE=0)\n", missing);
          return 20;
-@@ -789,8 +1006,13 @@ int main(int argc, char **argv) {
+@@ -789,8 +975,13 @@ int main(int argc, char **argv) {
      if (!isa_table && cpu_missing_sets) { printf("STOP: this CPU lacks %s and no rewrite table matches the image\n", missing); return 20; }
      /* The stubs follow the image in the same low mapping (rel32 jmps reach them). */
      size_t stub_area = isa_table ? round_page(isa_stub_area_size(isa_table)) : 0;
@@ -2048,7 +1976,7 @@ index f8f9c5e..c0de21e 100644
      image_size = size;
      if (fread(image, 1, size, f) != size || fgetc(f) != EOF) fail("incorrect memory image size");
      fclose(f);
-@@ -798,6 +1020,10 @@ int main(int argc, char **argv) {
+@@ -798,6 +989,10 @@ int main(int argc, char **argv) {
          printf("STOP: this CPU lacks %s and no rewrite table matches the image\n", missing);
          return 20;
      }
@@ -2059,7 +1987,7 @@ index f8f9c5e..c0de21e 100644
      if (!cpu_only) {
          char title[128]="PS4 game", serial[16]="UNKNOWN", sfo[4096];
          uint32_t attributes=0;
-@@ -862,6 +1088,12 @@ int main(int argc, char **argv) {
+@@ -862,6 +1057,12 @@ int main(int argc, char **argv) {
      printf("Guest TCB loads redirected to the TEB TLS slot: %" PRIu64 "\n", patch_tcb_loads(segments, ns));
  #endif
      if (!cpu_only) bbgpu_patch_image(image, size);
@@ -2357,10 +2285,10 @@ index 0000000..99d31b7
 +}
 diff --git a/tests/test_avx_rewrite.py b/tests/test_avx_rewrite.py
 new file mode 100644
-index 0000000..be3a07b
+index 0000000..bd71a0d
 --- /dev/null
 +++ b/tests/test_avx_rewrite.py
-@@ -0,0 +1,31 @@
+@@ -0,0 +1,27 @@
 +"""Plan logic and table encoding of scripts/avx_rewrite.py (no iced-x86 needed).  python3 tests/test_avx_rewrite.py"""
 +import sys, struct
 +sys.path.insert(0, 'scripts')
@@ -2383,21 +2311,17 @@ index 0000000..be3a07b
 +s = r.plan([I(0, 4, True), I(5, 4, True)]); assert s == []
 +# more than 32 bytes splits
 +s = r.plan([I(i * 5, 5, True) for i in range(10)]); assert [(x.n_insn, len(x.emu)) for x in s] == [(6, 30), (4, 20)]
-+# instruction boundaries of a run are recorded (a jump into the middle is resumed from them, src/avx_stub.c)
-+s = r.plan([I(0, 4, True), I(4, 5, True), I(9, 4, True)]); assert s[0].starts == 1 | 1 << 4 | 1 << 9
-+assert r.RECORD.size == 64
 +img = bytes(range(256))
 +t = r.encode_table(img, [r.Site(8, b'\xc5' * 8, 2, b'')])
 +assert len(t) == 64 + 64 and t[:8] == b'BBAVX1\0\0' and struct.unpack_from('<I', t, 48)[0] == 1
-+t2 = r.encode_table(img, [r.Site(8, b'\xc5' * 8, 2, b'', 0b10001)]); assert t2[64 + 11:64 + 15] == struct.pack('<I', 0b10001) and t2[64 + 15] == 0
 +open('/tmp/avx_table_test.bin', 'wb').write(t)
 +print('ok')
 diff --git a/tests/test_avx_stub.c b/tests/test_avx_stub.c
 new file mode 100644
-index 0000000..f7d1902
+index 0000000..667b946
 --- /dev/null
 +++ b/tests/test_avx_stub.c
-@@ -0,0 +1,161 @@
+@@ -0,0 +1,66 @@
 +/* Verifies src/avx_stub.c on a CPU with AVX (Linux): a leaf function that keeps data in its 128-byte
 + * red zone and runs a VEX run is executed natively and, as a copy patched with avx_stub_apply, through
 + * the stub + emulator. Return value (red zone data, flags, caller-saved regs) and the stored vectors
@@ -2409,8 +2333,6 @@ index 0000000..f7d1902
 +#include <stdlib.h>
 +#include <sys/mman.h>
 +#include "../src/avx_stub.h"
-+#include <signal.h>
-+#include <ucontext.h>
 +
 +/* %rdi, %rsi: red zone words; %rdx: output; %rcx: input (64 bytes).  The VEX run sits between run_N_s and run_N_e. */
 +#define FN(N, PRE, POST, LD1, RIP)                                                                   \
@@ -2444,7 +2366,9 @@ index 0000000..f7d1902
 +    site.offset = (uint64_t)(rs - fn); site.emu_len = (uint8_t)(re - rs); site.n_insn = (uint8_t)n_insn;
 +    memcpy(site.emu, rs, site.emu_len);
 +    AvxTable t; memset(&t, 0, sizeof t); t.sites = &site; t.count = 1; t.image_size = 0x10000;
++    unsigned char before[64]; memcpy(before, image + site.offset, site.emu_len);
 +    uint32_t done = avx_stub_apply(&t, image, stubs);
++    if (memcmp(before + 5, image + site.offset + 5, site.emu_len - 5)) { puts("interior bytes were modified"); return 1; }
 +    uint64_t stub = ((Fn)image)(0x1122334455667788ull, 0x99aabbccddeeff00ull, o2, in);
 +    int bad = done != 1 || native != stub || memcmp(o1, o2, sizeof o1);
 +    printf("case %d: rewritten=%u emu_len=%u native=%016llx stub=%016llx vectors %s -> %s\n", n, done, site.emu_len,
@@ -2455,107 +2379,12 @@ index 0000000..f7d1902
 +
 +static uint8_t shadow[256];
 +static void *get_shadow(void) { return shadow; }
-+
-+/* Entry into the middle of a rewritten run (128-bit forms: the prefix runs natively here, so ymm upper halves would not be in the shadow): the prefix loads xmm1/xmm2, then jumps to `mid_x` (the third instruction of the
-+ * run). The run is [mid_s, mid_e); its first two instructions are dead code here. The relocated instruction after it is
-+ * `movq -8(%rsp),%rax`, which reads the red zone. */
-+__asm__(".text\n.globl fnx\nfnx:\n"
-+        "movq %rdi,-8(%rsp)\nmovq %rsi,-0x80(%rsp)\nmovq %rdi,%r10\nmovq %rsi,%r11\nstc\n"
-+        "vmovups 0(%rcx),%xmm1\nvmovups 32(%rcx),%xmm2\n"
-+        "jmp mid_x\n"
-+        ".globl mid_s\nmid_s:\n"
-+        "vmovups 0(%rcx),%xmm1\n"                    /* +0, 4 bytes */
-+        "vmovups 16(%rcx),%xmm2\n"                   /* +4, 5 bytes */
-+        ".globl mid_x\nmid_x:\n"
-+        "vaddps %xmm1,%xmm2,%xmm3\n"                 /* +9 */
-+        ".globl mid_x2\nmid_x2:\n"
-+        "vmulps %xmm3,%xmm1,%xmm0\n"
-+        ".globl mid_x3\nmid_x3:\n"
-+        "vmovups %xmm3,0(%rdx)\nvmovups %xmm0,16(%rdx)\n"
-+        ".globl mid_e\nmid_e:\n"
-+        "movq -8(%rsp),%rax\nadcq -0x80(%rsp),%rax\naddq %r10,%rax\nxorq %r11,%rax\n"
-+        "ret\n.globl end_x\nend_x:\n");
-+extern char fnx[], mid_s[], mid_x[], mid_x2[], mid_x3[], mid_e[], end_x[];
-+
-+static AvxTable *trap_table;
-+static int trap_hits;
-+static void on_trap(int sig, siginfo_t *info, void *ctx) {
-+    (void)sig; (void)info;
-+    ucontext_t *uc = ctx;
-+    greg_t *g = uc->uc_mcontext.gregs;
-+    static const int idx[16] = {REG_RAX, REG_RCX, REG_RDX, REG_RBX, REG_RSP, REG_RBP, REG_RSI, REG_RDI,
-+                                REG_R8, REG_R9, REG_R10, REG_R11, REG_R12, REG_R13, REG_R14, REG_R15};
-+    AvxState st;
-+    memset(&st, 0, sizeof st);
-+    for (int i = 0; i < 16; ++i) st.gpr[i] = (uint64_t)g[idx[i]];
-+    st.rflags = (uint64_t)g[REG_EFL];
-+    for (int i = 0; i < 16; ++i) memcpy(st.xmm[i], uc->uc_mcontext.fpregs->_xmm[i].element, 16);
-+    memcpy(st.ymmh, shadow, sizeof st.ymmh);
-+    st.mxcsr = uc->uc_mcontext.fpregs->mxcsr;
-+    uintptr_t next;
-+    if (!avx_stub_resume(trap_table, (uintptr_t)g[REG_RIP] - 1, &st, &next)) _exit(3);
-+    for (int i = 0; i < 16; ++i) g[idx[i]] = (greg_t)st.gpr[i];
-+    g[REG_EFL] = (greg_t)st.rflags;
-+    for (int i = 0; i < 16; ++i) memcpy(uc->uc_mcontext.fpregs->_xmm[i].element, st.xmm[i], 16);
-+    memcpy(shadow, st.ymmh, sizeof st.ymmh);
-+    uc->uc_mcontext.fpregs->mxcsr = st.mxcsr;
-+    g[REG_RIP] = (greg_t)next;
-+    ++trap_hits;
-+}
-+
-+/* `entry` = which instruction boundary the jump lands on; `reloc` = relocate the instruction after the run. */
-+static int run_mid_case(const char *name, char *entry_label_unused, int reloc, int bad_entry) {
-+    (void)entry_label_unused;
-+    float in[16], o1[16], o2[16];
-+    for (int i = 0; i < 16; ++i) in[i] = (float)(i * 5 + 2) * 0.41f, o1[i] = o2[i] = 0;
-+    uint64_t native = ((Fn)fnx)(0x0123456789abcdefull, 0xfedcba9876543210ull, o1, in);
-+    size_t fl = (size_t)(end_x - fnx) + 64;
-+    unsigned char *region = mmap((void *)0x10000000, 1 << 20, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
-+    if (region == MAP_FAILED) { perror("mmap"); return 1; }
-+    unsigned char *image = region, *stubs = region + 0x10000;
-+    memcpy(image, fnx, fl);
-+    AvxSite site; memset(&site, 0, sizeof site);
-+    site.offset = (uint64_t)(mid_s - fnx);
-+    site.emu_len = (uint8_t)(mid_e - mid_s);
-+    site.n_insn = 6;
-+    site.reloc_len = reloc ? 5 : 0;
-+    memcpy(site.emu, mid_s, site.emu_len);
-+    if (reloc) memcpy(site.reloc, mid_e, 5);
-+    uint32_t starts = 0;
-+    char *b[] = {mid_s, mid_s + 4, mid_x, mid_x2, mid_x3, mid_x3 + 5};
-+    for (int i = 0; i < 6; ++i) starts |= 1u << (b[i] - mid_s);
-+    for (int i = 0; i < 4; ++i) site.starts[i] = (uint8_t)(starts >> (8 * i));
-+    AvxTable t; memset(&t, 0, sizeof t); t.sites = &site; t.count = 1; t.image_size = 0x10000;
-+    uint32_t done = avx_stub_apply(&t, image, stubs);
-+    trap_table = &t;
-+    trap_hits = 0;
-+    if (bad_entry) {                                   /* a byte that is not an instruction start: must not resume */
-+        int ok = !avx_stub_resume(&t, (uintptr_t)(image + site.offset + 6), &(AvxState){0}, &(uintptr_t){0});
-+        printf("case %s: mid-instruction entry %s\n", name, ok ? "refused -> ok" : "resumed -> FAIL");
-+        munmap(region, 1 << 20);
-+        return !ok;
-+    }
-+    struct sigaction sa;
-+    memset(&sa, 0, sizeof sa);
-+    sa.sa_sigaction = on_trap;
-+    sa.sa_flags = SA_SIGINFO;
-+    sigaction(SIGTRAP, &sa, NULL);
-+    uint64_t stub = ((Fn)image)(0x0123456789abcdefull, 0xfedcba9876543210ull, o2, in);
-+    int bad = done != 1 || trap_hits != 1 || native != stub || memcmp(o1, o2, sizeof o1);
-+    printf("case %s: rewritten=%u traps=%d native=%016llx resumed=%016llx vectors %s -> %s\n", name, done, trap_hits,
-+           (unsigned long long)native, (unsigned long long)stub, memcmp(o1, o2, sizeof o1) ? "DIFFER" : "equal", bad ? "FAIL" : "ok");
-+    munmap(region, 1 << 20);
-+    return bad;
-+}
 +int main(void) {
 +    avx_stub_set_hooks(get_shadow, NULL);
 +    int bad = 0;
 +    bad |= run_case(0, fn0, run_0_s, run_0_e, end_0, 6);
 +    bad |= run_case(1, fn1, run_1_s, run_1_e, end_1, 6);
 +    bad |= run_case(2, fn2, run_2_s, run_2_e, end_2, 6);
-+    bad |= run_mid_case("mid-run entry", NULL, 0, 0);
-+    bad |= run_mid_case("mid-run entry + relocated insn", NULL, 1, 0);
-+    bad |= run_mid_case("mid-instruction", NULL, 0, 1);
 +    puts(bad ? "FAILED" : "ALL OK");
 +    return bad;
 +}
