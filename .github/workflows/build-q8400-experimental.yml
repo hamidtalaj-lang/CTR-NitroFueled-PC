@@ -21,7 +21,7 @@ jobs:
           git config --global core.autocrlf false
           git config --global core.eol lf
 
-      - name: Checkout fork (workflow, source zip and avx-emulation.patch)
+      - name: Checkout fork (workflow, source zip and both AVX patches)
         uses: actions/checkout@v4
         with:
           path: input
@@ -40,6 +40,7 @@ jobs:
           $archive = Get-ChildItem input -Filter "CTR-NitroFueled-PC-0*.zip" | Select-Object -First 1
           if (!$archive) { throw "Missing CTR-NitroFueled-PC-0.4.zip in the root of your fork." }
           if (!(Test-Path input/avx-emulation.patch)) { throw "Missing avx-emulation.patch in the root of your fork." }
+          if (!(Test-Path input/avx-redzone-trampoline.patch)) { throw "Missing avx-redzone-trampoline.patch in the root of your fork." }
           Expand-Archive -LiteralPath $archive.FullName -DestinationPath source-unpacked -Force
           $root = Get-ChildItem source-unpacked -Directory | Select-Object -First 1
           if (!$root -or !(Test-Path (Join-Path $root.FullName "build.sh"))) { throw "Could not locate extracted source root/build.sh." }
@@ -53,6 +54,7 @@ jobs:
           }
           "SOURCE_DIR=$($root.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           Copy-Item input/avx-emulation.patch (Join-Path $root.FullName "avx-emulation.patch")
+          Copy-Item input/avx-redzone-trampoline.patch (Join-Path $root.FullName "avx-redzone-trampoline.patch")
 
       - name: Set up MSYS2 CLANG64
         uses: msys2/setup-msys2@v2
@@ -106,6 +108,8 @@ jobs:
           git commit -q -m "v0.4 source snapshot"
           git apply --check avx-emulation.patch
           git apply avx-emulation.patch
+          git apply --check avx-redzone-trampoline.patch
+          git apply avx-redzone-trampoline.patch
 
       - name: Build Windows binaries
         shell: msys2 {0}
