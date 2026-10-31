@@ -1,7 +1,8 @@
-diff -ruN -x out a/build.sh CTR-NitroFueled-PC-0.4/build.sh
---- a/build.sh	2026-10-19 04:51:11.000000000 +0000
-+++ b/build.sh	2026-10-20 01:32:45.562549010 +0000
-@@ -98,6 +98,8 @@
+diff --git a/build.sh b/build.sh
+index 7fdc4fa..b97b092 100644
+--- a/build.sh
++++ b/build.sh
+@@ -98,6 +98,8 @@ gpu=(-Lout/gpu -lbbgpu -Wl,-rpath,'$ORIGIN/gpu' -Wl,-rpath,"$PWD/out/gpu" -rdyna
  runtime=(src/runtime*.c)
  # isa_emulate runs inside guest code: no XMM/YMM.
  "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -mgeneral-regs-only -c src/isa_emulate.c -o out/isa_emulate.o
@@ -10,19 +11,21 @@ diff -ruN -x out a/build.sh CTR-NitroFueled-PC-0.4/build.sh
  # Third-party decoders: compiled once, without this project's -Werror policy.
  atrac9=(third_party/LibAtrac9/C/src/*.c)
  if [[ ! -f out/libatrac9.a || -n $(find third_party/LibAtrac9/C/src -newer out/libatrac9.a -name '*.c') ]]; then
-@@ -105,7 +107,7 @@
+@@ -105,7 +107,7 @@ if [[ ! -f out/libatrac9.a || -n $(find third_party/LibAtrac9/C/src -newer out/l
      for source in "${atrac9[@]}"; do "$CC" -std=c99 -O2 -g -w -c "$source" -o "out/atrac9/$(basename "${source%.c}").o"; done
      ar rcs out/libatrac9.a out/atrac9/*.o
  fi
 -"$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -no-pie "${includes[@]}" -I. -Isrc src/probe.c "${runtime[@]}" src/cpu_check.c src/vulkan_smoke.c out/isa_emulate.o src/isa_rewrite.c out/libatrac9.a -lm "${gpu[@]}" "${libraries[@]}" -o out/sacredfire
-+"$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -no-pie "${includes[@]}" -I. -Isrc src/probe.c "${runtime[@]}" src/cpu_check.c src/vulkan_smoke.c out/isa_emulate.o out/avx_emulate.o src/isa_rewrite.c out/libatrac9.a -lm "${gpu[@]}" "${libraries[@]}" -o out/sacredfire
++"$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -no-pie "${includes[@]}" -I. -Isrc src/probe.c "${runtime[@]}" src/cpu_check.c src/vulkan_smoke.c out/isa_emulate.o out/avx_emulate.o src/isa_rewrite.c src/avx_stub.c out/libatrac9.a -lm "${gpu[@]}" "${libraries[@]}" -o out/sacredfire
  echo "Built $PWD/out/sacredfire"
  # out/VERSION: the source revision this build came from (the nearest v* tag, else the commit;
  # "-dirty" when tracked files differ from it). run.sh prints it, the launcher shows it and the
-diff -ruN -x out a/docs/avx-emulation.md CTR-NitroFueled-PC-0.4/docs/avx-emulation.md
---- a/docs/avx-emulation.md	1970-01-01 00:00:00.000000000 +0000
-+++ b/docs/avx-emulation.md	2026-10-20 08:04:23.215204080 +0000
-@@ -0,0 +1,39 @@
+diff --git a/docs/avx-emulation.md b/docs/avx-emulation.md
+new file mode 100644
+index 0000000..de98b61
+--- /dev/null
++++ b/docs/avx-emulation.md
+@@ -0,0 +1,56 @@
 +# AVX / SSE4.2 / POPCNT emulation (CPUs older than Sandy Bridge)
 +
 +The game code is built for the PS4's Jaguar CPU and uses AVX (128 and 256 bit), F16C, POPCNT and
@@ -50,11 +53,28 @@ diff -ruN -x out a/docs/avx-emulation.md CTR-NitroFueled-PC-0.4/docs/avx-emulati
 +* Cost: one exception dispatch per fault (microseconds). Expect a very low frame
 +  rate; the point is to get the game running. Hot sites could later be rewritten to stubs
 +  (the existing ISA rewrite mechanism) reusing the same core.
-+* Windows caveat: the guest uses the System V red zone (128 bytes below rsp) and the Windows
-+  exception dispatcher does not preserve it. An AVX instruction inside a leaf function with live
-+  red-zone data corrupts that data. Linux (SIGILL) is unaffected.
++* Windows red zone: the guest uses the System V red zone (128 bytes below rsp) and the Windows
++  exception dispatcher writes the CONTEXT/EXCEPTION_RECORD *below rsp before any handler runs*, so a
++  fault inside a leaf function with live red-zone data corrupts that data; nothing in the handler can
++  repair it. Linux (SIGILL) is unaffected. Fix: `scripts/avx_rewrite.py` writes `out/avx-rewrite.bin`
++  (BBAVX1) and the loader (`src/avx_stub.c`, `--avx-rewrite`) patches each straight run of emulated
++  instructions with a 5-byte `jmp` to a 64-byte stub: `lea rsp,[rsp-0x100]`, save rax, call a shared
++  trampoline that saves every register / flags / MXCSR / xmm0-15, run the same emulator on a copy of the
++  bytes (`AvxState.ip_bias` keeps rip-relative operands pointing at the original address), restore,
++  `lea rsp,[rsp+0x108]`, run the one relocated plain instruction if the run was shorter than 5 bytes,
++  `jmp` back. No exception is raised, so the red zone is never touched. Runs that cannot be covered
++  (shorter than 5 bytes with no plain instruction after them, or branch targets inside) stay on the
++  fault-handler path. `BB_AVX_REWRITE=0` disables the table; the loader prints
++  `AVX: N of M runs rewritten to stubs`. Limits: like the ISA rewrite, an indirect jump into the middle
++  of a covered run is not detected (only direct branch targets are).
 +
-+## Test (needs a CPU with AVX, F16C, AES, PCLMUL, BMI1; Linux)
++## Tests
++
++    python3 tests/test_avx_rewrite.py          # run planning and table format (no iced-x86 needed)
++    gcc -std=gnu11 -O1 -mno-red-zone -no-pie -I src tests/test_avx_stub.c src/avx_stub.c src/isa_rewrite.c out/isa_emulate.o -lm -o out/avx-stub-test && out/avx-stub-test
++                                               # stub vs native on AVX hardware: red zone, flags, registers, vectors, rip-relative
++
++## Emulator test (needs a CPU with AVX, F16C, AES, PCLMUL, BMI1; Linux)
 +
 +    python3 scripts/avx_samples.py eboot.bin samples.txt
 +    gcc -std=gnu11 -O1 -mno-red-zone tests/test_avx_emulate.c -o out/avx-test
@@ -62,15 +82,16 @@ diff -ruN -x out a/docs/avx-emulation.md CTR-NitroFueled-PC-0.4/docs/avx-emulati
 +
 +Every encoding runs natively and through the emulator on the same random registers and memory;
 +registers, memory and flags are compared.
-diff -ruN -x out a/gpu/CMakeLists.txt CTR-NitroFueled-PC-0.4/gpu/CMakeLists.txt
---- a/gpu/CMakeLists.txt	2026-10-19 04:51:11.000000000 +0000
-+++ b/gpu/CMakeLists.txt	2026-10-20 01:43:18.617825769 +0000
-@@ -235,11 +235,13 @@
+diff --git a/gpu/CMakeLists.txt b/gpu/CMakeLists.txt
+index 7cf0bd4..8e14093 100644
+--- a/gpu/CMakeLists.txt
++++ b/gpu/CMakeLists.txt
+@@ -235,11 +235,13 @@ if (WIN32)
      target_compile_options(atrac9 PRIVATE -w)
      set_target_properties(atrac9 PROPERTIES C_STANDARD 99 INTERPROCEDURAL_OPTIMIZATION OFF)
      add_executable(sacredfire ../src/probe.c ${BB_RUNTIME} ../src/compat_win.c ../src/cpu_check.c ../src/vulkan_smoke.c
 -        ../src/isa_rewrite.c ../src/isa_emulate.c
-+        ../src/isa_rewrite.c ../src/isa_emulate.c ../src/avx_emulate.c
++        ../src/isa_rewrite.c ../src/isa_emulate.c ../src/avx_emulate.c ../src/avx_stub.c
          ../packaging/windows/sacredfire.rc)
      set_target_properties(sacredfire PROPERTIES C_STANDARD 11 C_EXTENSIONS OFF)
      # isa_emulate runs inside guest code: no XMM/YMM.
@@ -80,11 +101,166 @@ diff -ruN -x out a/gpu/CMakeLists.txt CTR-NitroFueled-PC-0.4/gpu/CMakeLists.txt
      # Newer clang (MSYS2) warns about write-only counters kept for diagnostics.
      target_compile_options(sacredfire PRIVATE $<$<COMPILE_LANGUAGE:C>:-Wall -Wextra -Werror
          -Wno-unknown-warning-option -Wno-unused-but-set-global>)
-Binary files a/scripts/__pycache__/game_check.cpython-312.pyc and CTR-NitroFueled-PC-0.4/scripts/__pycache__/game_check.cpython-312.pyc differ
-Binary files a/scripts/__pycache__/prepare.cpython-312.pyc and CTR-NitroFueled-PC-0.4/scripts/__pycache__/prepare.cpython-312.pyc differ
-diff -ruN -x out a/scripts/avx_samples.py CTR-NitroFueled-PC-0.4/scripts/avx_samples.py
---- a/scripts/avx_samples.py	1970-01-01 00:00:00.000000000 +0000
-+++ b/scripts/avx_samples.py	2026-10-20 01:33:45.964133183 +0000
+diff --git a/run.py b/run.py
+index 195919d..43237e0 100644
+--- a/run.py
++++ b/run.py
+@@ -338,6 +338,15 @@ def main():
+             emit(result.stdout)
+             if result.returncode == 0:
+                 isa_args = ['--isa-rewrite', str(out / 'isa-rewrite.bin')]
++        # AVX sites as stubs (no exception, so the guest's red zone survives on Windows): BB_AVX_REWRITE=0 turns it
++        # off, =1 forces it. The loader only uses the table when the AVX emulation is on; without it the sites stay
++        # on the fault-handler path.
++        if env.get('BB_AVX_REWRITE') != '0' and (env.get('BB_AVX_REWRITE') == '1' or isa_args):
++            result = run_python('scripts/avx_rewrite.py', out / 'boot-linked.bin', '--out', out,
++                                capture=True, check=False)
++            emit(result.stdout)
++            if result.returncode == 0:
++                isa_args += ['--avx-rewrite', str(out / 'avx-rewrite.bin')]
+         # Symbol names for the eboot's host-side imports (shadPS4's aerolib list, fetched once).
+         run_python('tools/gen_import_names.py', '--out', out)
+         # DLC (optional): the player's add-on packages in dlc\ (BB_DLC_DIR), reported installed.
+diff --git a/scripts/avx_rewrite.py b/scripts/avx_rewrite.py
+new file mode 100644
+index 0000000..57f3f52
+--- /dev/null
++++ b/scripts/avx_rewrite.py
+@@ -0,0 +1,129 @@
++#!/usr/bin/env python3
++"""Builds out/avx-rewrite.bin (BBAVX1), the table src/avx_stub.c applies at load time.
++
++The game's AVX / POPCNT / SSE4.2 instructions fault on a CPU without them. On Windows the fault is
++delivered with the exception record written *below rsp*, which destroys the System V red zone of the
++guest's leaf functions (see docs/avx-emulation.md). A site covered by this table is instead patched with
++a 5-byte jmp to a stub that skips 0x100 bytes below rsp first and emulates the instructions in
++ordinary code, so no exception is raised there. Sites this script cannot cover stay on the fault path.
++
++A site is a straight run of emulated instructions (up to 32 bytes, no instruction inside the run is a
++direct branch target). A run shorter than 5 bytes borrows the plain instruction after it, which then
++executes natively in the stub. BMI1/MOVBE/LZCNT/TZCNT are left to scripts/isa_rewrite.py.
++
++usage: avx_rewrite.py boot-linked.bin [--out DIR]       (needs `pip install iced-x86`)"""
++import argparse
++from dataclasses import dataclass
++import hashlib
++from pathlib import Path
++import struct
++import sys
++sys.path.insert(0, __file__.rsplit('/', 1)[0] if '/' in __file__ else '.')
++
++try:
++    import iced_x86
++    from iced_x86 import Decoder, EncodingKind, FlowControl, Mnemonic, OpKind
++except ImportError:
++    iced_x86 = None
++
++EMU_MAX, RELOC_MAX, MIN_COVER = 32, 16, 5
++HEADER = struct.Struct('<8sQ32sI12x')     # magic, image size, sha256, sites     (64 bytes)
++RECORD = struct.Struct('<QBBB5x32s16s')   # offset, emu_len, n_insn, reloc_len, emu, reloc (64 bytes, AvxSite)
++
++
++@dataclass
++class Insn:
++    ip: int
++    data: bytes
++    emulated: bool       # VEX / POPCNT / CRC32 / PCMPGTQ / PCMPxSTRx that the host may lack
++    plain: bool          # may be copied into a stub and run natively
++    target: bool         # a direct branch jumps here
++
++
++@dataclass
++class Site:
++    offset: int
++    emu: bytes
++    n_insn: int
++    reloc: bytes
++
++
++def plan(insns):
++    """Sites for a list of Insn in address order (pure function: the tests feed it hand-made lists)."""
++    sites, i = [], 0
++    while i < len(insns):
++        if not insns[i].emulated:
++            i += 1
++            continue
++        j, size = i, 0
++        while j < len(insns) and insns[j].emulated and (j == i or (not insns[j].target and insns[j].ip == insns[j - 1].ip + len(insns[j - 1].data))) \
++                and size + len(insns[j].data) <= EMU_MAX:
++            size += len(insns[j].data)
++            j += 1
++        reloc = b''
++        if size < MIN_COVER and j < len(insns):
++            nxt = insns[j]
++            if nxt.plain and not nxt.target and nxt.ip == insns[j - 1].ip + len(insns[j - 1].data) and len(nxt.data) <= RELOC_MAX:
++                reloc = nxt.data
++        if size + len(reloc) >= MIN_COVER:
++            sites.append(Site(insns[i].ip, b''.join(x.data for x in insns[i:j]), j - i, reloc))
++        i = max(j, i + 1)
++    return sites
++
++
++def encode_table(image, sites):
++    table = [HEADER.pack(b'BBAVX1\0\0', len(image), hashlib.sha256(image).digest(), len(sites))]
++    for s in sorted(sites, key=lambda s: s.offset):
++        table.append(RECORD.pack(s.offset, len(s.emu), s.n_insn, len(s.reloc), s.emu, s.reloc))
++    return b''.join(table)
++
++
++def _emulated(ins):
++    from isa_rewrite import kind_of, KIND_VCVTPH2PS, KIND_VCVTPS2PH
++    if kind_of(ins) not in (None, KIND_VCVTPH2PS, KIND_VCVTPS2PH):
++        return False                                   # isa_rewrite.py owns these
++    return ins.encoding == EncodingKind.VEX or ins.mnemonic in (
++        Mnemonic.POPCNT, Mnemonic.CRC32, Mnemonic.PCMPGTQ, Mnemonic.PCMPESTRI, Mnemonic.PCMPESTRM,
++        Mnemonic.PCMPISTRI, Mnemonic.PCMPISTRM)
++
++
++def scan_segment(code, address):
++    from isa_rewrite import is_plain
++    end = address + len(code)
++    insns, targets = [], set()
++    for ins in Decoder(64, code, ip=address):
++        if ins.flow_control in (FlowControl.UNCONDITIONAL_BRANCH, FlowControl.CONDITIONAL_BRANCH, FlowControl.CALL) \
++                and ins.op0_kind == OpKind.NEAR_BRANCH64:
++            targets.add(ins.near_branch_target)
++        emulated = _emulated(ins)
++        insns.append(Insn(ins.ip, code[ins.ip - address:ins.next_ip - address], emulated,
++                          not emulated and is_plain(ins, end), False))
++    for insn in insns:
++        insn.target = insn.ip in targets
++    return plan(insns)
++
++
++def main(argv):
++    p = argparse.ArgumentParser(description=__doc__)
++    p.add_argument('boot', type=Path)
++    p.add_argument('--out', type=Path, default=Path(__file__).resolve().parent.parent / 'out')
++    a = p.parse_args(argv)
++    try:
++        if iced_x86 is None:
++            raise RuntimeError('iced_x86 is not installed')
++        from isa_rewrite import read_boot_linked
++        from prepare import span
++        segments, image = read_boot_linked(a.boot.read_bytes())
++        sites = [site for address, size, flags in segments if flags & 1
++                 for site in scan_segment(span(image, address, size), address)]
++        (a.out / 'avx-rewrite.bin').write_bytes(encode_table(image, sites))
++    except (OSError, ValueError, RuntimeError) as e:
++        print(f'AVX: rewrite table unavailable ({e})')
++        return 1
++    n = sum(s.n_insn for s in sites)
++    print(f'AVX: {len(sites)} stub sites covering {n} instructions, {sum(1 for s in sites if s.reloc)} with a relocated instruction')
++    return 0
++
++
++if __name__ == '__main__':
++    sys.exit(main(sys.argv[1:]))
+diff --git a/scripts/avx_samples.py b/scripts/avx_samples.py
+new file mode 100644
+index 0000000..01148e5
+--- /dev/null
++++ b/scripts/avx_samples.py
 @@ -0,0 +1,41 @@
 +#!/usr/bin/env python3
 +"""Lists every distinct AVX (VEX) and POPCNT/CRC32/PCMPGTQ instruction encoding in eboot.bin, one hex
@@ -127,9 +303,11 @@ diff -ruN -x out a/scripts/avx_samples.py CTR-NitroFueled-PC-0.4/scripts/avx_sam
 +flush()
 +open(sys.argv[2], 'w').write('\n'.join(sorted(seen)) + '\n')
 +print(len(seen), 'distinct encodings')
-diff -ruN -x out a/src/avx_emulate.c CTR-NitroFueled-PC-0.4/src/avx_emulate.c
---- a/src/avx_emulate.c	1970-01-01 00:00:00.000000000 +0000
-+++ b/src/avx_emulate.c	2026-10-20 08:03:20.469965266 +0000
+diff --git a/src/avx_emulate.c b/src/avx_emulate.c
+new file mode 100644
+index 0000000..064caea
+--- /dev/null
++++ b/src/avx_emulate.c
 @@ -0,0 +1,1014 @@
 +/* See avx_emulate.h. Build with -mno-red-zone (the thunk call pushes below rsp). */
 +#include "avx_emulate.h"
@@ -273,7 +451,7 @@ diff -ruN -x out a/src/avx_emulate.c CTR-NitroFueled-PC-0.4/src/avx_emulate.c
 +}
 +
 +static uint64_t effective_address(const AvxState *s, const Dec *d, const uint8_t *insn) {
-+    if (d->ripr) return (uint64_t)(uintptr_t)(insn + d->len) + (uint64_t)d->disp;
++    if (d->ripr) return (uint64_t)(uintptr_t)(insn + d->len) + (uint64_t)s->ip_bias + (uint64_t)d->disp;
 +    uint64_t ea = (uint64_t)d->disp;
 +    if (d->has_base) ea += s->gpr[d->base];
 +    if (d->has_index) ea += s->gpr[d->index] << d->scale;
@@ -1145,10 +1323,12 @@ diff -ruN -x out a/src/avx_emulate.c CTR-NitroFueled-PC-0.4/src/avx_emulate.c
 +    *count = n;
 +    return total;
 +}
-diff -ruN -x out a/src/avx_emulate.h CTR-NitroFueled-PC-0.4/src/avx_emulate.h
---- a/src/avx_emulate.h	1970-01-01 00:00:00.000000000 +0000
-+++ b/src/avx_emulate.h	2026-10-20 03:02:45.475998613 +0000
-@@ -0,0 +1,37 @@
+diff --git a/src/avx_emulate.h b/src/avx_emulate.h
+new file mode 100644
+index 0000000..ec2cdc4
+--- /dev/null
++++ b/src/avx_emulate.h
+@@ -0,0 +1,38 @@
 +/* Emulation of the guest's AVX (VEX), POPCNT and SSE4.2 instructions on hosts that lack them
 + * (Core 2 / Penryn, e.g. Q8400, which stops at SSE4.1). The guest code is compiled for the PS4's
 + * Jaguar CPU: AVX 128/256 bit, F16C, no AVX2.
@@ -1172,6 +1352,7 @@ diff -ruN -x out a/src/avx_emulate.h CTR-NitroFueled-PC-0.4/src/avx_emulate.h
 +    uint8_t ymmh[16][16];      /* bits 255:128 (shadow: the host has no ymm) */
 +    uint64_t rflags;
 +    uint32_t mxcsr;
++    int64_t ip_bias;           /* real address of an instruction minus the address its bytes are read from (0 unless they are a copy, avx_stub.c) */
 +} AvxState;
 +
 +/* Executes the instruction at `insn` on `s`. Returns its length (> 0) on success, 0 when it is
@@ -1186,18 +1367,301 @@ diff -ruN -x out a/src/avx_emulate.h CTR-NitroFueled-PC-0.4/src/avx_emulate.h
 +int avx_emulate_run(AvxState *s, const uint8_t *insn, int max_insns, int *count, char *why, size_t why_size);
 +
 +#endif
-diff -ruN -x out a/src/probe.c CTR-NitroFueled-PC-0.4/src/probe.c
---- a/src/probe.c	2026-10-19 04:51:11.000000000 +0000
-+++ b/src/probe.c	2026-10-21 04:00:20.883423142 +0000
-@@ -9,6 +9,7 @@
+diff --git a/src/avx_stub.c b/src/avx_stub.c
+new file mode 100644
+index 0000000..5f39c6b
+--- /dev/null
++++ b/src/avx_stub.c
+@@ -0,0 +1,178 @@
++/* See avx_stub.h. */
++#include "avx_stub.h"
++#include "isa_rewrite.h"
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++_Static_assert(sizeof(AvxSite) == 64, "AvxSite is a 64 byte record");
++_Static_assert(sizeof(AvxRegs) == 400, "the trampoline assumes a 400 byte frame");
++
++static AvxShadowFn shadow_fn;
++static AvxFatalFn fatal_fn;
++static AvxTable *g_table;
++
++void avx_stub_set_hooks(AvxShadowFn shadow, AvxFatalFn fatal) { shadow_fn = shadow; fatal_fn = fatal; }
++
++static void die(const char *why) {
++    if (fatal_fn) fatal_fn(why);
++    fprintf(stderr, "AVX stub: %s\n", why);
++    fflush(NULL);
++    abort();
++}
++
++/* Runs on the trampoline's frame (SysV registers on every host: the trampoline is hand-written asm). */
++#if defined(__x86_64__)
++__attribute__((sysv_abi))
++#endif
++void bb_avx_dispatch(AvxRegs *r, const AvxSite *site) {
++    static uint8_t zero_shadow[256];
++    uint8_t *shadow = shadow_fn ? (uint8_t *)shadow_fn() : NULL;
++    if (!shadow) shadow = zero_shadow;
++    AvxState st;
++    memset(&st, 0, sizeof st);
++    memcpy(st.gpr, r->gpr, sizeof st.gpr);
++    memcpy(st.xmm, r->xmm, sizeof st.xmm);
++    memcpy(st.ymmh, shadow, sizeof st.ymmh);
++    st.rflags = r->rflags;
++    st.mxcsr = r->mxcsr;
++    uint8_t buf[AVX_EMU_MAX + 16];
++    memset(buf, 0, sizeof buf);
++    memcpy(buf, site->emu, site->emu_len);
++    st.ip_bias = (int64_t)((uintptr_t)(g_table->image + site->offset) - (uintptr_t)buf);
++    unsigned off = 0;
++    for (unsigned i = 0; i < site->n_insn; ++i) {
++        char why[200];
++        int len = avx_emulate(&st, buf + off, why, sizeof why);
++        if (len <= 0) die(why);
++        off += (unsigned)len;
++    }
++    if (off != site->emu_len) die("emulated length differs from the table");
++    memcpy(r->gpr, st.gpr, sizeof st.gpr);
++    memcpy(r->xmm, st.xmm, sizeof st.xmm);
++    memcpy(shadow, st.ymmh, sizeof st.ymmh);
++    r->rflags = st.rflags;
++    r->mxcsr = st.mxcsr;
++}
++
++/* Entered by `call` from a stub: rax = site, [rsp] = return into the stub, [rsp+8] = the guest's rax,
++ * and the guest's rsp is rsp + 0x110. Builds an AvxRegs, calls bb_avx_dispatch, restores everything and
++ * returns with rsp at the saved-rax slot (the stub then does lea rsp,[rsp+0x108]). */
++void bb_avx_tramp(void);
++__asm__(
++    ".text\n"
++    ".globl bb_avx_tramp\n"
++    "bb_avx_tramp:\n"
++    "pushfq\n"
++    "cld\n"
++    "pushq %rbp\n"
++    "movq %rsp, %rbp\n"
++    "subq $400, %rsp\n"
++    "andq $-16, %rsp\n"
++    "movq %rcx, 8(%rsp)\n movq %rdx, 16(%rsp)\n movq %rbx, 24(%rsp)\n"
++    "movq %rsi, 48(%rsp)\n movq %rdi, 56(%rsp)\n"
++    "movq %r8, 64(%rsp)\n movq %r9, 72(%rsp)\n movq %r10, 80(%rsp)\n movq %r11, 88(%rsp)\n"
++    "movq %r12, 96(%rsp)\n movq %r13, 104(%rsp)\n movq %r14, 112(%rsp)\n movq %r15, 120(%rsp)\n"
++    "movq 24(%rbp), %rcx\n movq %rcx, 0(%rsp)\n"          /* guest rax */
++    "movq 0(%rbp), %rcx\n movq %rcx, 40(%rsp)\n"           /* guest rbp */
++    "leaq 0x120(%rbp), %rcx\n movq %rcx, 32(%rsp)\n"       /* guest rsp */
++    "movq 8(%rbp), %rcx\n movq %rcx, 128(%rsp)\n"          /* guest rflags */
++    "stmxcsr 136(%rsp)\n"
++    "movups %xmm0, 144(%rsp)\n movups %xmm1, 160(%rsp)\n movups %xmm2, 176(%rsp)\n movups %xmm3, 192(%rsp)\n"
++    "movups %xmm4, 208(%rsp)\n movups %xmm5, 224(%rsp)\n movups %xmm6, 240(%rsp)\n movups %xmm7, 256(%rsp)\n"
++    "movups %xmm8, 272(%rsp)\n movups %xmm9, 288(%rsp)\n movups %xmm10, 304(%rsp)\n movups %xmm11, 320(%rsp)\n"
++    "movups %xmm12, 336(%rsp)\n movups %xmm13, 352(%rsp)\n movups %xmm14, 368(%rsp)\n movups %xmm15, 384(%rsp)\n"
++    "movq %rax, %rsi\n"
++    "movq %rsp, %rdi\n"
++    "call bb_avx_dispatch\n"
++    "ldmxcsr 136(%rsp)\n"
++    "movups 144(%rsp), %xmm0\n movups 160(%rsp), %xmm1\n movups 176(%rsp), %xmm2\n movups 192(%rsp), %xmm3\n"
++    "movups 208(%rsp), %xmm4\n movups 224(%rsp), %xmm5\n movups 240(%rsp), %xmm6\n movups 256(%rsp), %xmm7\n"
++    "movups 272(%rsp), %xmm8\n movups 288(%rsp), %xmm9\n movups 304(%rsp), %xmm10\n movups 320(%rsp), %xmm11\n"
++    "movups 336(%rsp), %xmm12\n movups 352(%rsp), %xmm13\n movups 368(%rsp), %xmm14\n movups 384(%rsp), %xmm15\n"
++    "movq 8(%rsp), %rcx\n movq 16(%rsp), %rdx\n movq 24(%rsp), %rbx\n"
++    "movq 48(%rsp), %rsi\n movq 56(%rsp), %rdi\n"
++    "movq 64(%rsp), %r8\n movq 72(%rsp), %r9\n movq 80(%rsp), %r10\n movq 88(%rsp), %r11\n"
++    "movq 96(%rsp), %r12\n movq 104(%rsp), %r13\n movq 112(%rsp), %r14\n movq 120(%rsp), %r15\n"
++    "movq 40(%rsp), %rax\n movq %rax, 0(%rbp)\n"           /* new rbp into its saved slot */
++    "movq 128(%rsp), %rax\n movq %rax, 8(%rbp)\n"          /* new rflags into its slot */
++    "movq 0(%rsp), %rax\n"
++    "movq %rbp, %rsp\n"
++    "popq %rbp\n"
++    "popfq\n"
++    "ret\n");
++
++size_t avx_stub_area_size(uint32_t count) { return (size_t)count * AVX_STUB_BYTES; }
++
++static void put32(unsigned char *p, uint32_t v) { for (int i = 0; i < 4; ++i) p[i] = (unsigned char)(v >> (8 * i)); }
++static void put64(unsigned char *p, uint64_t v) { for (int i = 0; i < 8; ++i) p[i] = (unsigned char)(v >> (8 * i)); }
++
++uint32_t avx_stub_apply(AvxTable *t, unsigned char *image, unsigned char *stubs) {
++    static const unsigned char head[] = {0x48, 0x8D, 0xA4, 0x24, 0x00, 0xFF, 0xFF, 0xFF,   /* lea rsp,[rsp-0x100] */
++                                         0x50,                                             /* push rax */
++                                         0x48, 0xB8};                                      /* mov rax, imm64 */
++    static const unsigned char tail[] = {0x48, 0x8D, 0xA4, 0x24, 0x08, 0x01, 0x00, 0x00};   /* lea rsp,[rsp+0x108] */
++    t->image = image; t->stubs = stubs; t->skipped = 0;
++    g_table = t;
++    uint32_t done = 0;
++    for (uint32_t i = 0; i < t->count; ++i) {
++        const AvxSite *s = &t->sites[i];
++        unsigned covered = (unsigned)s->emu_len + s->reloc_len;
++        unsigned char *at = image + s->offset, *st = stubs + (size_t)i * AVX_STUB_BYTES;
++        if (s->emu_len == 0 || s->emu_len > AVX_EMU_MAX || s->reloc_len > AVX_RELOC_MAX || covered < 5 ||
++            s->offset > t->image_size || covered > t->image_size - s->offset ||
++            memcmp(at, s->emu, s->emu_len) || memcmp(at + s->emu_len, s->reloc, s->reloc_len)) { ++t->skipped; continue; }
++        unsigned n = 0;
++        memcpy(st, head, sizeof head); n = sizeof head;
++        put64(st + n, (uint64_t)(uintptr_t)s); n += 8;
++        st[n++] = 0xFF; st[n++] = 0x15; put32(st + n, (uint32_t)(AVX_STUB_BYTES - 8 - (n + 4))); n += 4;   /* call [rip+target] */
++        memcpy(st + n, tail, sizeof tail); n += sizeof tail;
++        memcpy(st + n, s->reloc, s->reloc_len); n += s->reloc_len;
++        int64_t back = (int64_t)((uintptr_t)(at + covered) - (uintptr_t)(st + n + 5));
++        int64_t fwd = (int64_t)((uintptr_t)st - (uintptr_t)(at + 5));
++        if (back != (int32_t)back || fwd != (int32_t)fwd) { ++t->skipped; memset(st, 0xCC, AVX_STUB_BYTES); continue; }
++        st[n++] = 0xE9; put32(st + n, (uint32_t)(int32_t)back); n += 4;
++        while (n < AVX_STUB_BYTES - 8) st[n++] = 0xCC;
++        put64(st + AVX_STUB_BYTES - 8, (uint64_t)(uintptr_t)&bb_avx_tramp);
++        at[0] = 0xE9; put32(at + 1, (uint32_t)(int32_t)fwd);
++        memset(at + 5, 0xCC, covered - 5);
++        ++done;
++    }
++    return done;
++}
++
++int avx_stub_site_of(const AvxTable *t, uintptr_t rip) {
++    if (!t || !t->stubs || rip < (uintptr_t)t->stubs) return -1;
++    size_t i = (rip - (uintptr_t)t->stubs) / AVX_STUB_BYTES;
++    return i < t->count ? (int)i : -1;
++}
++
++static IsaTable *unused_guard;   /* keeps isa_rewrite.h in the include set for isa_sha256 */
++
++AvxTable *avx_table_load(const char *path) {
++    (void)unused_guard;
++    FILE *f = fopen(path, "rb");
++    if (!f) { fprintf(stderr, "AVX: cannot open rewrite table %s\n", path); return NULL; }
++    unsigned char h[64];
++    if (fread(h, 1, sizeof h, f) != sizeof h || memcmp(h, "BBAVX1\0\0", 8)) { fprintf(stderr, "AVX: not a BBAVX1 table: %s\n", path); fclose(f); return NULL; }
++    uint32_t count = (uint32_t)h[48] | (uint32_t)h[49] << 8 | (uint32_t)h[50] << 16 | (uint32_t)h[51] << 24;
++    if (count > (1u << 22) || fseek(f, 0, SEEK_END) || ftell(f) != (long)(sizeof h + (uint64_t)count * sizeof(AvxSite)) || fseek(f, sizeof h, SEEK_SET)) {
++        fprintf(stderr, "AVX: table size does not match its site count\n"); fclose(f); return NULL;
++    }
++    AvxTable *t = calloc(1, sizeof *t);
++    if (t) t->sites = calloc(count ? count : 1, sizeof *t->sites);
++    if (!t || !t->sites || fread(t->sites, sizeof *t->sites, count, f) != count) { fprintf(stderr, "AVX: cannot read table\n"); fclose(f); if (t) { free(t->sites); free(t); } return NULL; }
++    fclose(f);
++    t->count = count;
++    t->image_size = 0;
++    for (int i = 7; i >= 0; --i) t->image_size = t->image_size << 8 | h[8 + i];
++    memcpy(t->sha256, h + 16, 32);
++    return t;
++}
++
++int avx_table_matches(const AvxTable *t, const unsigned char *image, uint64_t size) {
++    if (size != t->image_size) return 1;
++    uint8_t d[32];
++    isa_sha256(image, size, d);
++    return memcmp(d, t->sha256, 32) != 0;
++}
+diff --git a/src/avx_stub.h b/src/avx_stub.h
+new file mode 100644
+index 0000000..fb865b3
+--- /dev/null
++++ b/src/avx_stub.h
+@@ -0,0 +1,66 @@
++/* Load-time rewrite of AVX / POPCNT / SSE4.2 sites into stubs (red-zone safe).
++ *
++ * Why: on Windows the exception dispatcher writes CONTEXT below rsp *before* any handler runs,
++ * so a fault inside a System V leaf function destroys its 128-byte red zone. The fault-handler
++ * emulation (probe.c) cannot fix that. Here the site is patched with a 5-byte jmp to a stub that
++ * first moves rsp down 0x100 bytes (lea: flags untouched), saves every register, and only then
++ * calls the same emulator (avx_emulate.c) on a saved copy of the original bytes. No exception
++ * is raised, so nothing is ever written into the red zone.
++ *
++ * Table: BBAVX1, written by scripts/avx_rewrite.py. Sites it cannot cover (no 5 bytes without
++ * crossing a branch target) stay on the fault-handler path. */
++#ifndef BB_AVX_STUB_H
++#define BB_AVX_STUB_H
++#include <stddef.h>
++#include <stdint.h>
++#include "avx_emulate.h"
++
++#define AVX_EMU_MAX 32     /* bytes of emulated instructions per site */
++#define AVX_RELOC_MAX 16   /* bytes of the plain instruction copied into the stub */
++
++typedef struct {           /* 64 bytes on disk */
++    uint64_t offset;       /* image offset of the first covered byte */
++    uint8_t emu_len;       /* bytes of the instructions to emulate */
++    uint8_t n_insn;        /* how many instructions that is */
++    uint8_t reloc_len;     /* 0, or the length of a plain instruction run natively after them */
++    uint8_t reserved[5];
++    uint8_t emu[AVX_EMU_MAX];      /* their original bytes */
++    uint8_t reloc[AVX_RELOC_MAX];  /* the relocated instruction's original bytes */
++} AvxSite;                 /* covered = emu_len + reloc_len >= 5 */
++
++typedef struct {
++    AvxSite *sites;
++    uint32_t count;
++    uint64_t image_size;
++    uint8_t sha256[32];
++    unsigned char *image, *stubs;   /* set by avx_stub_apply */
++    uint64_t skipped;
++} AvxTable;
++
++enum { AVX_STUB_BYTES = 64 };   /* lea, push, mov, call, lea, relocated insn, jmp, 8-byte target */
++
++/* Frame the trampoline builds; the dispatcher reads and writes it. */
++typedef struct {
++    uint64_t gpr[16];      /* x86 numbering; gpr[4] = the guest's rsp */
++    uint64_t rflags;
++    uint32_t mxcsr, pad;
++    uint8_t xmm[16][16];
++} AvxRegs;
++
++/* Pointer to the calling thread's 16x16 byte ymm-upper shadow (256 bytes). */
++typedef void *(*AvxShadowFn)(void);
++/* Called when an instruction cannot be emulated: `why` is one line. Must not return. */
++typedef void (*AvxFatalFn)(const char *why);
++void avx_stub_set_hooks(AvxShadowFn shadow, AvxFatalFn fatal);
++
++size_t avx_stub_area_size(uint32_t count);
++/* Patches the sites into `image` and writes the stubs into `stubs` (RW, area size; it must lie within +-2 GB of the image).
++ * A site whose bytes no longer match the table is skipped. Returns the number rewritten. */
++uint32_t avx_stub_apply(AvxTable *t, unsigned char *image, unsigned char *stubs);
++
++AvxTable *avx_table_load(const char *path);          /* NULL and one stderr line when invalid */
++int avx_table_matches(const AvxTable *t, const unsigned char *image, uint64_t size);  /* 0 = match */
++/* Index of the site whose stub holds rip, or -1 (for fault reports). */
++int avx_stub_site_of(const AvxTable *t, uintptr_t rip);
++
++#endif
+diff --git a/src/isa_rewrite.c b/src/isa_rewrite.c
+index 3ce4ce9..8d15ee5 100644
+--- a/src/isa_rewrite.c
++++ b/src/isa_rewrite.c
+@@ -134,6 +134,8 @@ IsaTable *isa_table_load(const char *path) {
+     return t;
+ }
+ 
++void isa_sha256(const unsigned char *data, uint64_t size, uint8_t out[32]) { sha256(data, size, out); }
++
+ int isa_table_matches(const IsaTable *t, const unsigned char *image, uint64_t size) {
+     if (size != t->image_size) return 1;
+     uint8_t digest[32];
+diff --git a/src/isa_rewrite.h b/src/isa_rewrite.h
+index 3cff4bb..eb077e3 100644
+--- a/src/isa_rewrite.h
++++ b/src/isa_rewrite.h
+@@ -24,6 +24,7 @@ enum { ISA_STUB_BYTES = 256 };
+ IsaTable *isa_table_load(const char *path);
+ /* 0 when size and sha256 match the image. */
+ int isa_table_matches(const IsaTable *t, const unsigned char *image, uint64_t size);
++void isa_sha256(const unsigned char *data, uint64_t size, uint8_t out[32]);   /* shared with avx_stub.c */
+ size_t isa_stub_area_size(const IsaTable *t);           /* count * ISA_STUB_BYTES */
+ unsigned isa_site_set(const IsaSite *s);                 /* CPU_SET_* of the kind */
+ /* Rewrites the sites whose set is in `sets` (spec 5.4). Writes nothing and returns
+diff --git a/src/probe.c b/src/probe.c
+index f8f9c5e..9690cb4 100644
+--- a/src/probe.c
++++ b/src/probe.c
+@@ -9,6 +9,8 @@
  #include "runtime.h"
  #include "gpu/bbgpu.h"
  #include "isa_rewrite.h"
 +#include "avx_emulate.h"
++#include "avx_stub.h"
  #if !defined(__x86_64__) || !defined(__GNUC__)
  #error This prototype requires x86-64 GCC or Clang (including MinGW).
  #endif
-@@ -46,6 +47,55 @@
+@@ -46,6 +48,63 @@ static int gpu_enabled;
  static unsigned cpu_missing_sets; /* CPU_SET_* the host lacks; the guest code needs them rewritten */
  static IsaTable *isa_table; /* rewritten sites (--isa-rewrite); the fault handlers and the report read it */
  static void isa_report_hook(void) { isa_rewrite_report(isa_table, stdout); }
@@ -1233,6 +1697,14 @@ diff -ruN -x out a/src/probe.c CTR-NitroFueled-PC-0.4/src/probe.c
 +    return NULL;
 +}
 +static unsigned long long avx_traps;
++/* avx-rewrite.bin (scripts/avx_rewrite.py): sites patched with a jmp to a red-zone-safe stub (src/avx_stub.c). */
++static AvxTable *avx_table;
++static void *avx_stub_shadow(void) { AvxThread *t = avx_thread(); return t ? (void *)t->ymmh : NULL; }
++static void avx_stub_fatal(const char *why) {
++    fprintf(stderr, "AVX emulation stopped: %s\n", why);
++    fflush(NULL);
++    _exit(21);
++}
 +static void avx_count(int instructions) {
 +    unsigned long long traps = __atomic_add_fetch(&avx_traps, 1, __ATOMIC_RELAXED);
 +    unsigned long long n = __atomic_add_fetch(&avx_emulated, (unsigned long long)instructions, __ATOMIC_RELAXED);
@@ -1253,7 +1725,7 @@ diff -ruN -x out a/src/probe.c CTR-NitroFueled-PC-0.4/src/probe.c
  int vulkan_smoke(void);
  
  static void fail(const char *message) { fprintf(stderr, "ERROR: %s\n", message); exit(1); }
-@@ -60,14 +110,29 @@
+@@ -60,14 +119,29 @@ static void fail(const char *message) { fprintf(stderr, "ERROR: %s\n", message);
  static int cpu_supported(char *missing, size_t size) {
      missing[0] = 0;
      const char *skip = getenv("BB_SKIP_CPU_CHECK");
@@ -1285,7 +1757,20 @@ diff -ruN -x out a/src/probe.c CTR-NitroFueled-PC-0.4/src/probe.c
      return 1;
  }
  static uint64_t read64(FILE *f) {
-@@ -185,6 +250,33 @@
+@@ -164,8 +238,11 @@ static void describe_address(char *out, size_t size, uintptr_t address) {
+     HMODULE module=NULL;
+     char name[MAX_PATH]="?";
+     int site=isa_table ? isa_rewrite_site_of_stub(isa_table,address) : -1;
+-    if (site>=0 || (image && address-(uintptr_t)image<0x20000000)) {
++    int avx_site=avx_table ? avx_stub_site_of(avx_table,address) : -1;
++    if (site>=0 || avx_site>=0 || (image && address-(uintptr_t)image<0x20000000)) {
+         int n=snprintf(out,size,"guest offset 0x%" PRIxPTR,address-(uintptr_t)image);
++        if (avx_site>=0 && n>=0 && (size_t)n<size)
++            snprintf(out+n,size-n," While emulating AVX stub site 0x%" PRIx64,avx_table->sites[avx_site].offset);
+         if (site>=0 && n>=0 && (size_t)n<size)
+             snprintf(out+n,size-n," While emulating site 0x%" PRIx64 " (%s)",isa_table->sites[site].offset,isa_kind_name(isa_table->sites[site].kind));
+         return;
+@@ -185,6 +262,34 @@ static void isa_context_regs(CONTEXT *c, IsaRegs *regs, int to_context) {
      for (int i=0;i<16;++i) { if (to_context) *g[i]=regs->gpr[i]; else regs->gpr[i]=*g[i]; }
      if (to_context) c->EFlags=(DWORD)regs->rflags; else regs->rflags=c->EFlags;
  }
@@ -1301,6 +1786,7 @@ diff -ruN -x out a/src/probe.c CTR-NitroFueled-PC-0.4/src/probe.c
 +    for (int i = 0; i < 16; ++i) memcpy(st.xmm[i], &c->FltSave.XmmRegisters[i], 16);
 +    memcpy(st.ymmh, t->ymmh, sizeof st.ymmh);
 +    st.mxcsr = c->MxCsr;
++    st.ip_bias = 0;
 +    char why[200];
 +    int count = 0;
 +    int len = avx_emulate_run(&st, (const uint8_t *)(uintptr_t)c->Rip, avx_run_max, &count, why, sizeof why);
@@ -1319,7 +1805,7 @@ diff -ruN -x out a/src/probe.c CTR-NitroFueled-PC-0.4/src/probe.c
  const char *runtime_thread_current_name(void);
  static int fatal_reported;
  static LONG fatal_exception(EXCEPTION_POINTERS *info) {
-@@ -193,6 +285,27 @@
+@@ -193,6 +298,27 @@ static LONG fatal_exception(EXCEPTION_POINTERS *info) {
      const CONTEXT *c=info->ContextRecord;
      char where[MAX_PATH+64];
      describe_address(where,sizeof(where),(uintptr_t)c->Rip);
@@ -1347,7 +1833,7 @@ diff -ruN -x out a/src/probe.c CTR-NitroFueled-PC-0.4/src/probe.c
      if (record->ExceptionCode==EXCEPTION_ACCESS_VIOLATION && record->NumberParameters>=2)
          fprintf(stderr,"Fault: %s access to %p at %s (thread %lu)\n",
                  record->ExceptionInformation[0]==1 ? "write" : record->ExceptionInformation[0]==8 ? "execute" : "read",
-@@ -265,6 +378,11 @@
+@@ -265,6 +391,11 @@ static LONG fatal_exception(EXCEPTION_POINTERS *info) {
  static LONG CALLBACK vectored_fault(EXCEPTION_POINTERS *info) {
      const EXCEPTION_RECORD *record=info->ExceptionRecord;
      DWORD code=record->ExceptionCode;
@@ -1359,7 +1845,7 @@ diff -ruN -x out a/src/probe.c CTR-NitroFueled-PC-0.4/src/probe.c
      if (code==EXCEPTION_BREAKPOINT && isa_table) {
          /* An int3 ISA site: emulated here; any other breakpoint goes on to the report below. */
          IsaRegs regs;
-@@ -328,7 +446,33 @@
+@@ -328,7 +459,34 @@ static uint64_t patch_tcb_loads(const Segment *segments, uint64_t count) {
  /* ucontext gregs of IsaRegs.gpr (x86 numbering). */
  static const int isa_gregs[16]={REG_RAX,REG_RCX,REG_RDX,REG_RBX,REG_RSP,REG_RBP,REG_RSI,REG_RDI,
                                  REG_R8,REG_R9,REG_R10,REG_R11,REG_R12,REG_R13,REG_R14,REG_R15};
@@ -1374,6 +1860,7 @@ diff -ruN -x out a/src/probe.c CTR-NitroFueled-PC-0.4/src/probe.c
 +    for (int i = 0; i < 16; ++i) memcpy(st.xmm[i], fp->_xmm[i].element, 16);
 +    memcpy(st.ymmh, t->ymmh, sizeof st.ymmh);
 +    st.mxcsr = fp->mxcsr;
++    st.ip_bias = 0;
 +    char why[200];
 +    int count = 0;
 +    int len = avx_emulate_run(&st, (const uint8_t *)(uintptr_t)g[REG_RIP], avx_run_max, &count, why, sizeof why);
@@ -1393,7 +1880,24 @@ diff -ruN -x out a/src/probe.c CTR-NitroFueled-PC-0.4/src/probe.c
      if (sig == SIGTRAP && isa_table) {
          /* An int3 ISA site (RIP is past the CC byte); any other trap ends in the report below. */
          greg_t *g = ((ucontext_t *)context)->uc_mcontext.gregs;
-@@ -615,6 +759,7 @@
+@@ -591,7 +749,7 @@ int main(int argc, char **argv) {
+ #endif
+     int cpu_only = 0, strict_imports = 0, list_imports = 0;
+     unsigned timeout_seconds = 10;
+-    const char *content_profile=NULL, *app0=NULL, *user_dir=NULL, *patch_file=NULL, *import_names=NULL, *isa_file=NULL;
++    const char *content_profile=NULL, *app0=NULL, *user_dir=NULL, *patch_file=NULL, *import_names=NULL, *isa_file=NULL, *avx_file=NULL;
+     for (int i = 2; i < argc; ++i) {
+         if (!strcmp(argv[i], "--cpu-only")) cpu_only = 1;
+         else if (!strcmp(argv[i], "--strict-imports")) strict_imports = 1;
+@@ -603,6 +761,7 @@ int main(int argc, char **argv) {
+         else if (!strcmp(argv[i], "--user") && i+1<argc) user_dir=argv[++i];
+         else if (!strcmp(argv[i], "--patches") && i+1<argc) patch_file=argv[++i];
+         else if (!strcmp(argv[i], "--isa-rewrite") && i+1<argc) isa_file=argv[++i];
++        else if (!strcmp(argv[i], "--avx-rewrite") && i+1<argc) avx_file=argv[++i];
+         else if (!strcmp(argv[i], "--timeout") && i+1<argc) timeout_seconds=(unsigned)strtoul(argv[++i],NULL,10);
+         else { fprintf(stderr, "Unknown option: %s\n", argv[i]); return 1; }
+     }
+@@ -615,6 +774,7 @@ int main(int argc, char **argv) {
      /* BB_ISA_REWRITE=0 never rewrites, =1 rewrites every site; by default the sets the CPU lacks. */
      const char *policy = getenv("BB_ISA_REWRITE");
      unsigned isa_sets = policy && !strcmp(policy, "1") ? 0xffffffffu : policy && !strcmp(policy, "0") ? 0 : cpu_missing_sets;
@@ -1401,9 +1905,50 @@ diff -ruN -x out a/src/probe.c CTR-NitroFueled-PC-0.4/src/probe.c
      if (cpu_missing_sets && !isa_sets) {
          printf("STOP: this CPU lacks %s and the rewrite is disabled (BB_ISA_REWRITE=0)\n", missing);
          return 20;
-diff -ruN -x out a/tests/test_avx_emulate.c CTR-NitroFueled-PC-0.4/tests/test_avx_emulate.c
---- a/tests/test_avx_emulate.c	1970-01-01 00:00:00.000000000 +0000
-+++ b/tests/test_avx_emulate.c	2026-10-20 08:03:36.616148811 +0000
+@@ -789,8 +949,13 @@ int main(int argc, char **argv) {
+     if (!isa_table && cpu_missing_sets) { printf("STOP: this CPU lacks %s and no rewrite table matches the image\n", missing); return 20; }
+     /* The stubs follow the image in the same low mapping (rel32 jmps reach them). */
+     size_t stub_area = isa_table ? round_page(isa_stub_area_size(isa_table)) : 0;
+-    image = allocate(round_page(size) + stub_area);
++    /* avx-rewrite.bin only matters when the AVX emulation is on (the CPU lacks AVX); a missing or stale table is not fatal:
++     * the sites then stay on the fault-handler path. */
++    if (avx_emulation && avx_file) avx_table = avx_table_load(avx_file);
++    size_t avx_area = avx_table ? round_page(avx_stub_area_size(avx_table->count)) : 0;
++    image = allocate(round_page(size) + stub_area + avx_area);
+     unsigned char *stubs = image + round_page(size);
++    unsigned char *avx_stubs = stubs + stub_area;
+     image_size = size;
+     if (fread(image, 1, size, f) != size || fgetc(f) != EOF) fail("incorrect memory image size");
+     fclose(f);
+@@ -798,6 +963,10 @@ int main(int argc, char **argv) {
+         printf("STOP: this CPU lacks %s and no rewrite table matches the image\n", missing);
+         return 20;
+     }
++    if (avx_table && avx_table_matches(avx_table, image, size)) {
++        fprintf(stderr, "AVX: rewrite table does not match the image, not used\n");
++        free(avx_table->sites); free(avx_table); avx_table = NULL; avx_area = 0;
++    }
+     if (!cpu_only) {
+         char title[128]="PS4 game", serial[16]="UNKNOWN", sfo[4096];
+         uint32_t attributes=0;
+@@ -862,6 +1031,12 @@ int main(int argc, char **argv) {
+     printf("Guest TCB loads redirected to the TEB TLS slot: %" PRIu64 "\n", patch_tcb_loads(segments, ns));
+ #endif
+     if (!cpu_only) bbgpu_patch_image(image, size);
++    if (avx_table) {   /* before the ISA rewrite: its relocated instructions must not be ones this one replaces */
++        avx_stub_set_hooks(avx_stub_shadow, avx_stub_fatal);
++        uint32_t n = avx_stub_apply(avx_table, image, avx_stubs);
++        printf("AVX: %u of %u runs rewritten to stubs, %llu left to the fault handler\n", n, avx_table->count, (unsigned long long)avx_table->skipped);
++        protect(avx_stubs, avx_area, 5);
++    }
+     if (isa_table) {
+         IsaReport r = isa_rewrite_apply(isa_table, image, stubs, isa_sets);
+         if (r.unsupported_needed) {
+diff --git a/tests/test_avx_emulate.c b/tests/test_avx_emulate.c
+new file mode 100644
+index 0000000..99d31b7
+--- /dev/null
++++ b/tests/test_avx_emulate.c
 @@ -0,0 +1,277 @@
 +/* Verifies src/avx_emulate.c against real AVX hardware: every instruction listed in the samples
 + * file (hex bytes, one per line; scripts/avx_samples.py makes it from eboot.bin) is run natively
@@ -1681,4 +2226,107 @@ diff -ruN -x out a/tests/test_avx_emulate.c CTR-NitroFueled-PC-0.4/tests/test_av
 +           samples, tested, passed, failed, unsupported, skipped, native_fault, mxdiff);
 +    for (int i = 0; i < nreasons; ++i) printf("  %5d x %s\n", reasons[i].n, reasons[i].text);
 +    return failed ? 1 : 0;
++}
+diff --git a/tests/test_avx_rewrite.py b/tests/test_avx_rewrite.py
+new file mode 100644
+index 0000000..bd71a0d
+--- /dev/null
++++ b/tests/test_avx_rewrite.py
+@@ -0,0 +1,27 @@
++"""Plan logic and table encoding of scripts/avx_rewrite.py (no iced-x86 needed).  python3 tests/test_avx_rewrite.py"""
++import sys, struct
++sys.path.insert(0, 'scripts')
++import avx_rewrite as r
++
++def I(ip, n, emu=False, plain=False, target=False):
++    return r.Insn(ip, bytes([0xC5 if emu else 0x90]) * n, emu, plain, target)
++
++# run of three VEX insns (12 bytes) -> one site
++s = r.plan([I(0, 4, True), I(4, 4, True), I(8, 4, True), I(12, 1, plain=True)]); assert [(x.offset, x.n_insn, x.reloc) for x in s] == [(0, 3, b'')]
++# lone 4-byte VEX + plain next -> relocated
++s = r.plan([I(0, 4, True), I(4, 2, plain=True)]); assert len(s) == 1 and s[0].reloc == b'\x90\x90'
++# lone 4-byte VEX, next is not plain -> skipped
++assert r.plan([I(0, 4, True), I(4, 2)]) == []
++# lone 4-byte VEX, next plain but a branch target -> skipped
++assert r.plan([I(0, 4, True), I(4, 2, plain=True, target=True)]) == []
++# branch target inside a run splits it: [0..8) then [8..)
++s = r.plan([I(0, 4, True), I(4, 4, True), I(8, 4, True, target=True), I(12, 4, True)]); assert [(x.offset, x.n_insn) for x in s] == [(0, 2), (8, 2)]
++# a gap between instructions (data in code) ends the run
++s = r.plan([I(0, 4, True), I(5, 4, True)]); assert s == []
++# more than 32 bytes splits
++s = r.plan([I(i * 5, 5, True) for i in range(10)]); assert [(x.n_insn, len(x.emu)) for x in s] == [(6, 30), (4, 20)]
++img = bytes(range(256))
++t = r.encode_table(img, [r.Site(8, b'\xc5' * 8, 2, b'')])
++assert len(t) == 64 + 64 and t[:8] == b'BBAVX1\0\0' and struct.unpack_from('<I', t, 48)[0] == 1
++open('/tmp/avx_table_test.bin', 'wb').write(t)
++print('ok')
+diff --git a/tests/test_avx_stub.c b/tests/test_avx_stub.c
+new file mode 100644
+index 0000000..e572367
+--- /dev/null
++++ b/tests/test_avx_stub.c
+@@ -0,0 +1,64 @@
++/* Verifies src/avx_stub.c on a CPU with AVX (Linux): a leaf function that keeps data in its 128-byte
++ * red zone and runs a VEX run is executed natively and, as a copy patched with avx_stub_apply, through
++ * the stub + emulator. Return value (red zone data, flags, caller-saved regs) and the stored vectors
++ * must match.
++ *   gcc -std=gnu11 -O1 -mno-red-zone -no-pie -I src tests/test_avx_stub.c src/avx_stub.c src/isa_rewrite.c -lm -o out/avx-stub-test */
++#define _GNU_SOURCE
++#include "../src/avx_emulate.c"
++#include <stdio.h>
++#include <stdlib.h>
++#include <sys/mman.h>
++#include "../src/avx_stub.h"
++
++/* %rdi, %rsi: red zone words; %rdx: output; %rcx: input (64 bytes).  The VEX run sits between run_N_s and run_N_e. */
++#define FN(N, PRE, POST, LD1, RIP)                                                                   \
++    __asm__(".text\n.globl fn" #N "\nfn" #N ":\n" PRE                                           \
++            "movq %rdi,-8(%rsp)\nmovq %rsi,-0x80(%rsp)\nmovq %rdi,%r10\nmovq %rsi,%r11\nstc\n"  \
++            ".globl run_" #N "_s\nrun_" #N "_s:\n"                                              \
++            LD1 "vmovups 32(%rcx),%ymm2\n" RIP                               \
++            "vaddps %ymm1,%ymm2,%ymm3\nvmulps %ymm3,%ymm1,%ymm0\n"                              \
++            "vmovups %ymm3,0(%rdx)\nvmovups %ymm0,32(%rdx)\n"                                   \
++            ".globl run_" #N "_e\nrun_" #N "_e:\n"                                              \
++            "movq -8(%rsp),%rax\nadcq -0x80(%rsp),%rax\naddq %r10,%rax\nxorq %r11,%rax\n" POST  \
++            "ret\n.globl end_" #N "\nend_" #N ":\n.balign 32\n.globl data_" #N "\ndata_" #N ":\n" \
++            ".float 1.5,2.5,3.5,4.5,5.5,6.5,7.5,8.5\n");
++#define L1 "vmovups 0(%rcx),%ymm1\n"
++FN(0, "", "", L1, "")
++FN(1, "pushq %rbp\n", "popq %rbp\n", L1, "")
++FN(2, "", "", "", "vmovups data_2(%rip),%ymm1\n")
++typedef uint64_t (*Fn)(uint64_t, uint64_t, void *, const void *);
++extern char fn0[], run_0_s[], run_0_e[], end_0[], fn1[], run_1_s[], run_1_e[], end_1[], fn2[], run_2_s[], run_2_e[], end_2[];
++
++static int run_case(int n, char *fn, char *rs, char *re, char *en, int n_insn) {
++    float in[16], o1[16], o2[16];
++    for (int i = 0; i < 16; ++i) in[i] = (float)(i * 3 + 1) * 0.37f, o1[i] = o2[i] = 0;
++    uint64_t native = ((Fn)fn)(0x1122334455667788ull, 0x99aabbccddeeff00ull, o1, in);
++    size_t fl = (size_t)(en - fn) + 64;                          /* code + data after it */
++    unsigned char *region = mmap((void *)0x10000000, 1 << 20, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
++    if (region == MAP_FAILED) { perror("mmap"); return 1; }
++    unsigned char *image = region, *stubs = region + 0x10000;
++    memcpy(image, fn, fl);
++    AvxSite site; memset(&site, 0, sizeof site);
++    site.offset = (uint64_t)(rs - fn); site.emu_len = (uint8_t)(re - rs); site.n_insn = (uint8_t)n_insn;
++    memcpy(site.emu, rs, site.emu_len);
++    AvxTable t; memset(&t, 0, sizeof t); t.sites = &site; t.count = 1; t.image_size = 0x10000;
++    uint32_t done = avx_stub_apply(&t, image, stubs);
++    uint64_t stub = ((Fn)image)(0x1122334455667788ull, 0x99aabbccddeeff00ull, o2, in);
++    int bad = done != 1 || native != stub || memcmp(o1, o2, sizeof o1);
++    printf("case %d: rewritten=%u emu_len=%u native=%016llx stub=%016llx vectors %s -> %s\n", n, done, site.emu_len,
++           (unsigned long long)native, (unsigned long long)stub, memcmp(o1, o2, sizeof o1) ? "DIFFER" : "equal", bad ? "FAIL" : "ok");
++    munmap(region, 1 << 20);
++    return bad;
++}
++
++static uint8_t shadow[256];
++static void *get_shadow(void) { return shadow; }
++int main(void) {
++    avx_stub_set_hooks(get_shadow, NULL);
++    int bad = 0;
++    bad |= run_case(0, fn0, run_0_s, run_0_e, end_0, 6);
++    bad |= run_case(1, fn1, run_1_s, run_1_e, end_1, 6);
++    bad |= run_case(2, fn2, run_2_s, run_2_e, end_2, 6);
++    puts(bad ? "FAILED" : "ALL OK");
++    return bad;
 +}
